@@ -34,6 +34,9 @@ const initDB = async () => {
     await safeAddColumn('users', 'is_banned', 'BOOLEAN DEFAULT FALSE');
     await safeAddColumn('users', 'last_admin_msg_id', 'INTEGER');
     await safeAddColumn('users', 'last_active_time', 'BIGINT');
+    
+    // --- THE FIX: Add created_at to users so the Invite Dashboard can sort them ---
+    await safeAddColumn('users', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP');
 
     // 2. Transactions Table
     const createTransactions = `
