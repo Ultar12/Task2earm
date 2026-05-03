@@ -18,6 +18,7 @@ const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), 
 
 const pendingCaptchas = new Map();
 const userStates = new Map(); 
+let resolvedGroupEntity = null; // Caches the group data on startup
 
 async function isUserAllowed(userId) {
     const res = await pool.query('SELECT is_banned FROM users WHERE chat_id = $1', [userId]);
@@ -67,28 +68,25 @@ async function sendNewNotification(userId, adminId, text, now) {
 
 async function checkMembership(userId) {
     try {
-        let groupId = process.env.GROUP_ID;
-        if (/^-?\d+$/.test(groupId)) groupId = BigInt(groupId);
+        if (!resolvedGroupEntity) {
+            console.log("Verification failed: Group entity is missing.");
+            return false;
+        }
 
         await userBot.invoke(new Api.channels.GetParticipant({
-            channel: groupId,
+            channel: resolvedGroupEntity,
             participant: userId
         }));
-        return true; // Successfully confirmed they are in the group
+        return true; 
     } catch (e) {
-        // Protect against rate limit bans (Assume true so we don't wipe accounts during audits)
         if (e.code === 420 || String(e).toUpperCase().includes('FLOOD')) {
             return true; 
         }
         
-        // Log the error to your Heroku console so you can see exactly why it's failing
         console.log(`[Audit Failed for ${userId}]:`, e.message || e.className);
-        
-        // STRICT FALLBACK: Any other error means they are NOT verified.
         return false; 
     }
 }
-
 
 async function auditUser(userId) {
     if (userId.toString() === process.env.ADMIN_ID) return false;
@@ -511,7 +509,7 @@ bot.on('callback_query', async (query) => {
 
         await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
         bot.editMessageText(query.message.text + "\n\nStatus: APPROVED", { chat_id: chatId, message_id: query.message.message_id });
-        bot.sendMessage(targetUser, "Your withdrawal request has been approved and processed.").catch(()=>{});
+        bot.sendMessage(targetUser, "Your withdrawal request has been approved and processed. Check /records for details.").catch(()=>{});
     }
 
     if (data.startsWith('reject_') && userId.toString() === process.env.ADMIN_ID) {
@@ -525,7 +523,7 @@ bot.on('callback_query', async (query) => {
         await pool.query("INSERT INTO transactions (chat_id, type, amount, status) VALUES ($1, $2, $3, $4)", [targetUser, 'refund', amount, 'completed']);
         
         bot.editMessageText(query.message.text + "\n\nStatus: REJECTED (Refunded)", { chat_id: chatId, message_id: query.message.message_id });
-        bot.sendMessage(targetUser, `Your withdrawal request of ${amount.toLocaleString()} NGN was rejected. The funds have been refunded to your bot balance.`).catch(()=>{});
+        bot.sendMessage(targetUser, `Your withdrawal request of ${amount.toLocaleString()} NGN was rejected. The funds have been refunded to your bot balance. Check /records for details.`).catch(()=>{});
     }
 });
 
@@ -534,5 +532,20 @@ bot.on('callback_query', async (query) => {
     console.log("Connecting UserBot...");
     await userBot.connect();
     console.log("UserBot connected.");
+
+    console.log("Scanning chats for the group...");
+    const dialogs = await userBot.getDialogs();
+    for (const dialog of dialogs) {
+        if (dialog.title && dialog.title.includes('M4U-Nigeria')) {
+            resolvedGroupEntity = dialog.entity;
+            console.log(`Found group: ${dialog.title}`);
+            break;
+        }
+    }
+
+    if (!resolvedGroupEntity) {
+        console.log("WARNING: Could not find M4U-Nigeria in userbot's chat list. Make sure your userbot account is in the group.");
+    }
+
     console.log(`Main bot is running on Webhooks, port: ${port}`);
 })();
