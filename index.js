@@ -20,18 +20,13 @@ const pendingCaptchas = new Map();
 const userStates = new Map(); 
 let resolvedGroupEntity = null; 
 
-// --- HELPER: CLEAN UI ENGINE ---
-// This function ensures the bot only uses one message block per user, editing it instead of spamming.
-async function sendOrEdit(chatId, userId, text, options = {}) {
+// --- HELPER: CLEAN UI ENGINE (Standard Keyboard Version) ---
+// Deletes the bot's old message and sends a new one so the chat stays clean
+async function replaceMessage(chatId, userId, text, options = {}) {
     const state = userStates.get(userId) || {};
     
     if (state.lastBotMsgId) {
-        try {
-            await bot.editMessageText(text, { chat_id: chatId, message_id: state.lastBotMsgId, ...options });
-            return;
-        } catch (e) {
-            // If the message was deleted or is exactly the same, fall through to send a new one
-        }
+        bot.deleteMessage(chatId, state.lastBotMsgId).catch(() => {});
     }
     
     const sentMsg = await bot.sendMessage(chatId, text, options);
@@ -138,7 +133,7 @@ async function auditUser(userId) {
 
             await pool.query('UPDATE users SET balance = 0, is_verified = FALSE WHERE chat_id = $1', [userId]);
             await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'penalty_left_group', -currentBalance]);
-            bot.sendMessage(userId, "System Audit Failed: You left the required group. Your account has been unverified and your balance reset to 0 NGN.").catch(()=>{});
+            bot.sendMessage(userId, "System Audit Failed: You left the required group. Your account has been unverified and your balance reset to 0 NGN.", { reply_markup: { remove_keyboard: true } }).catch(()=>{});
 
             if (referrer) {
                 await pool.query('UPDATE users SET balance = GREATEST(balance - 50, 0) WHERE chat_id = $1', [referrer]);
@@ -151,20 +146,21 @@ async function auditUser(userId) {
     return false; 
 }
 
-const mainInlineMenu = {
+const mainMenu = {
     reply_markup: {
-        inline_keyboard: [
-            [{ text: 'Tasks & Sign-in', callback_data: 'menu_tasks' }, { text: 'Invite Dashboard', callback_data: 'menu_invite' }],
-            [{ text: 'My Balance', callback_data: 'menu_balance' }, { text: 'Top Referrers', callback_data: 'menu_toprefs' }],
-            [{ text: 'Transaction Records', callback_data: 'menu_records' }],
-            [{ text: 'Support', callback_data: 'menu_support' }]
-        ]
+        keyboard: [
+            [{ text: 'Task' }, { text: 'Invite Dashboard' }],
+            [{ text: 'Balance' }, { text: 'Top Referrers' }],
+            [{ text: 'Records' }, { text: 'Support' }]
+        ],
+        resize_keyboard: true
     }
 };
 
-const cancelInlineMenu = {
+const cancelMenu = {
     reply_markup: {
-        inline_keyboard: [[{ text: 'Cancel Operation', callback_data: 'menu_main' }]]
+        keyboard: [[{ text: 'Cancel' }]],
+        resize_keyboard: true
     }
 };
 
@@ -183,6 +179,12 @@ bot.on('message', async (msg) => {
     const isAdmin = userId.toString() === process.env.ADMIN_ID;
     let state = userStates.get(userId) || {};
 
+    if (text === 'Cancel' || text === '/cancel') {
+        state.step = null;
+        userStates.set(userId, state);
+        return replaceMessage(chatId, userId, "Operation cancelled.", mainMenu);
+    }
+
     if (text.startsWith('/start')) {
         const payload = text.split(' ')[1]; 
         const referredBy = payload ? parseInt(payload) : null;
@@ -199,25 +201,25 @@ bot.on('message', async (msg) => {
             );
         } else if (res.rows[0].is_verified || isAdmin) {
             await trackUserActivity(msg, "Started Bot");
-            return sendOrEdit(chatId, userId, "Welcome back to your dashboard.", mainInlineMenu);
+            return replaceMessage(chatId, userId, "Welcome back to your dashboard.", mainMenu);
         }
 
         if (isAdmin) {
-            return sendOrEdit(chatId, userId, "Welcome Admin. Verification bypassed.", mainInlineMenu);
+            return replaceMessage(chatId, userId, "Welcome Admin. Verification bypassed.", mainMenu);
         }
 
         const num1 = Math.floor(Math.random() * 10) + 1;
         const num2 = Math.floor(Math.random() * 10) + 1;
         pendingCaptchas.set(userId, { answer: num1 + num2, referredBy });
 
-        return sendOrEdit(chatId, userId, `To proceed, please solve this simple math problem:\n\n${num1} + ${num2} = ?\n\nType the correct number below.`);
+        return replaceMessage(chatId, userId, `To proceed, please solve this simple math problem:\n\n${num1} + ${num2} = ?\n\nType the correct number below.`);
     }
 
     if (pendingCaptchas.has(userId)) {
         const expected = pendingCaptchas.get(userId).answer;
         if (parseInt(text) === expected) {
             pendingCaptchas.delete(userId);
-            return sendOrEdit(chatId, userId, "Captcha passed!\n\nNow, you must join our group to use this bot.", {
+            return replaceMessage(chatId, userId, "Captcha passed!\n\nNow, you must join our group to use this bot.", {
                 reply_markup: {
                     inline_keyboard: [
                         [{ text: "Join Group", url: "https://t.me/+jgcu6IbmbisxOTM1" }],
@@ -227,29 +229,23 @@ bot.on('message', async (msg) => {
                 }
             });
         } else {
-            return sendOrEdit(chatId, userId, "Incorrect. Type the correct answer, or send /start for a new captcha.");
+            return replaceMessage(chatId, userId, "Incorrect. Type the correct answer, or send /start for a new captcha.");
         }
     }
 
     if (state.step) {
-        if (text === '/cancel') {
-            state.step = null;
-            userStates.set(userId, state);
-            return sendOrEdit(chatId, userId, "Operation cancelled.", mainInlineMenu);
-        }
-
         if (state.step === 'AWAITING_BANK_NAME') {
             state.bank_name = text;
             state.step = 'AWAITING_ACCOUNT_NAME';
             userStates.set(userId, state);
-            return sendOrEdit(chatId, userId, "Bank name saved. Now, type your Account Name:", cancelInlineMenu);
+            return replaceMessage(chatId, userId, "Bank name saved. Now, type your Account Name:", cancelMenu);
         }
 
         if (state.step === 'AWAITING_ACCOUNT_NAME') {
             state.account_name = text;
             state.step = 'AWAITING_ACCOUNT_NUMBER';
             userStates.set(userId, state);
-            return sendOrEdit(chatId, userId, "Account name saved. Finally, type your Account Number:", cancelInlineMenu);
+            return replaceMessage(chatId, userId, "Account name saved. Finally, type your Account Number:", cancelMenu);
         }
 
         if (state.step === 'AWAITING_ACCOUNT_NUMBER') {
@@ -260,14 +256,14 @@ bot.on('message', async (msg) => {
                 );
                 state.step = null;
                 userStates.set(userId, state);
-                return sendOrEdit(chatId, userId, "Your bank information has been successfully saved.", mainInlineMenu);
+                return replaceMessage(chatId, userId, "Your bank information has been successfully saved.", mainMenu);
             } catch (err) {
                 state.step = null;
                 userStates.set(userId, state);
                 if (err.code === '23505') {
-                    return sendOrEdit(chatId, userId, "Error: This account number is already registered to another user.", mainInlineMenu);
+                    return replaceMessage(chatId, userId, "Error: This account number is already registered to another user.", mainMenu);
                 }
-                return sendOrEdit(chatId, userId, "An error occurred while saving your details.", mainInlineMenu);
+                return replaceMessage(chatId, userId, "An error occurred while saving your details.", mainMenu);
             }
         }
 
@@ -277,11 +273,11 @@ bot.on('message', async (msg) => {
             const minWithdraw = parseInt(process.env.MIN_WITHDRAW) || 500;
 
             if (isNaN(amount) || amount < minWithdraw) {
-                return sendOrEdit(chatId, userId, `Please enter a valid number that is at least ${minWithdraw.toLocaleString()}.`, cancelInlineMenu);
+                return replaceMessage(chatId, userId, `Please enter a valid number that is at least ${minWithdraw.toLocaleString()}.`, cancelMenu);
             }
 
             if (amount > user.balance) {
-                return sendOrEdit(chatId, userId, `Insufficient balance. Your current balance is ${user.balance.toLocaleString()} NGN.`, cancelInlineMenu);
+                return replaceMessage(chatId, userId, `Insufficient balance. Your current balance is ${user.balance.toLocaleString()} NGN.`, cancelMenu);
             }
 
             try {
@@ -291,7 +287,7 @@ bot.on('message', async (msg) => {
                 
                 state.step = null;
                 userStates.set(userId, state);
-                sendOrEdit(chatId, userId, "Withdrawal submitted successfully. Waiting for admin approval...", mainInlineMenu);
+                replaceMessage(chatId, userId, "Withdrawal submitted successfully. Waiting for admin approval...", mainMenu);
 
                 const adminMessage = `New Withdrawal Request:\n\nUser ID: ${userId}\nUsername: ${user.username || 'None'}\nAmount: ${amount.toLocaleString()} NGN\n\nBank: ${user.bank_name}\nName: ${user.account_name}\nAccount: ${user.account_number}`;
                 bot.sendMessage(process.env.ADMIN_ID, adminMessage, {
@@ -303,135 +299,72 @@ bot.on('message', async (msg) => {
                     }
                 });
             } catch (err) {
-                sendOrEdit(chatId, userId, "An error occurred while processing your withdrawal.", mainInlineMenu);
+                replaceMessage(chatId, userId, "An error occurred while processing your withdrawal.", mainMenu);
             }
             return;
         }
     }
 
-    // --- TEXT COMMAND FALLBACKS (If user manually types them) ---
     const userStatus = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [userId]);
     const isVerified = userStatus.rows.length > 0 && userStatus.rows[0].is_verified;
 
     if (!isVerified && !isAdmin && !text.startsWith('/start')) {
-        return sendOrEdit(chatId, userId, "You must complete the verification process first.");
+        return replaceMessage(chatId, userId, "You must complete the verification process first.", { reply_markup: { remove_keyboard: true }});
     }
 
-    if (text === '/signin') {
-        processSignin(chatId, userId, msg);
-    } 
-    else if (text === '/toprefs') {
-        processTopRefs(chatId, userId, msg);
-    }
-    else if (text === '/setbank') {
-        state.step = 'AWAITING_BANK_NAME';
-        userStates.set(userId, state);
-        sendOrEdit(chatId, userId, "Please type your Bank Name:", cancelInlineMenu);
-    }
-    else if (text === '/withdraw') {
-        const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
-        const user = res.rows[0];
-        if (!user.bank_name || !user.account_name || !user.account_number) {
-            return sendOrEdit(chatId, userId, "You have not set your bank info yet. Please click 'Set Bank Details' in your balance menu.", mainInlineMenu);
-        }
-        state.step = 'AWAITING_WITHDRAW_AMOUNT';
-        state.user = user;
-        userStates.set(userId, state);
-        sendOrEdit(chatId, userId, `Type the amount you want to withdraw (Min: ${process.env.MIN_WITHDRAW || 500} NGN):`, cancelInlineMenu);
-    }
-});
-
-// --- MENU ACTION PROCESSORS ---
-async function processSignin(chatId, userId, msg) {
-    if (await auditUser(userId)) return;
-    await trackUserActivity(msg, "Attempted Sign-in");
-
-    const refCheck = await pool.query('SELECT COUNT(*) FROM users WHERE referred_by = $1 AND is_verified = TRUE', [userId]);
-    if (parseInt(refCheck.rows[0].count) === 0) {
-        return sendOrEdit(chatId, userId, "You cannot sign in yet. You must have at least 1 verified referral to unlock daily sign-ins.", mainInlineMenu);
-    }
-
-    const todayCheck = await pool.query(`SELECT id FROM transactions WHERE chat_id = $1 AND type = 'signin_bonus' AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`, [userId]);
-    if (todayCheck.rows.length > 0) {
-        return sendOrEdit(chatId, userId, "You have already claimed your daily sign-in bonus today. Come back tomorrow!", mainInlineMenu);
-    }
-
-    await pool.query('UPDATE users SET balance = balance + 10 WHERE chat_id = $1', [userId]);
-    await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'signin_bonus', 10]);
-    
-    sendOrEdit(chatId, userId, "Sign-in successful! 10 NGN has been added to your balance.", mainInlineMenu);
-}
-
-async function processTopRefs(chatId, userId, msg) {
-    if (await auditUser(userId)) return;
-    await trackUserActivity(msg, "Checked Leaderboard");
-    const isAdmin = userId.toString() === process.env.ADMIN_ID;
-
-    const res = await pool.query(`
-        SELECT u.username, COUNT(r.chat_id) as ref_count 
-        FROM users u 
-        JOIN users r ON r.referred_by = u.chat_id 
-        WHERE r.is_verified = TRUE 
-        GROUP BY u.chat_id, u.username 
-        ORDER BY ref_count DESC 
-        LIMIT 10
-    `);
-
-    if (res.rows.length === 0) {
-        return sendOrEdit(chatId, userId, "The leaderboard is currently empty.", mainInlineMenu);
-    }
-
-    let board = "Top 10 Referrers:\n\n";
-    res.rows.forEach((row, index) => {
-        const displayNick = isAdmin ? (row.username || 'Unknown') : maskUsername(row.username);
-        board += `${index + 1}. ${displayNick} - ${row.ref_count} invites\n`;
-    });
-
-    sendOrEdit(chatId, userId, board, mainInlineMenu);
-}
-
-bot.on('callback_query', async (query) => {
-    const userId = query.from.id;
-    const chatId = query.message.chat.id;
-    const data = query.data;
-
-    if (!(await isUserAllowed(userId))) return bot.answerCallbackQuery(query.id);
-
-    // --- NAVIGATION CALLBACKS ---
-    if (data === 'menu_main') {
-        let state = userStates.get(userId) || {};
-        state.step = null;
-        userStates.set(userId, state);
-        return sendOrEdit(chatId, userId, "Main Dashboard", mainInlineMenu);
-    }
-
-    if (data === 'menu_tasks') {
-        bot.answerCallbackQuery(query.id);
-        const taskMenu = {
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: 'Claim Daily Sign-In (10 NGN)', callback_data: 'action_signin' }],
-                    [{ text: 'Back to Menu', callback_data: 'menu_main' }]
-                ]
-            }
-        };
-        return sendOrEdit(chatId, userId, "Task Center:\n\nDaily Sign-in Requires at least 1 verified referral.", taskMenu);
-    }
-
-    if (data === 'action_signin') {
-        bot.answerCallbackQuery(query.id);
-        return processSignin(chatId, userId, query.message);
-    }
-
-    if (data === 'menu_toprefs') {
-        bot.answerCallbackQuery(query.id);
-        return processTopRefs(chatId, userId, query.message);
-    }
-
-    if (data === 'menu_invite') {
-        bot.answerCallbackQuery(query.id);
+    if (text === 'Task') {
         if (await auditUser(userId)) return;
-        await trackUserActivity(query.message, "Opened Invite Dashboard");
+        await trackUserActivity(msg, "Checked Tasks");
+        replaceMessage(chatId, userId, "Task Center:\n\n1. /signin - Claim 10 NGN daily.\n(Note: You must have at least 1 verified referral to use this).", mainMenu);
+    } 
+    else if (text === '/signin') {
+        if (await auditUser(userId)) return;
+        await trackUserActivity(msg, "Attempted Sign-in");
+
+        const refCheck = await pool.query('SELECT COUNT(*) FROM users WHERE referred_by = $1 AND is_verified = TRUE', [userId]);
+        if (parseInt(refCheck.rows[0].count) === 0) {
+            return replaceMessage(chatId, userId, "You cannot sign in yet. You must have at least 1 verified referral to unlock daily sign-ins.", mainMenu);
+        }
+
+        const todayCheck = await pool.query(`SELECT id FROM transactions WHERE chat_id = $1 AND type = 'signin_bonus' AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`, [userId]);
+        if (todayCheck.rows.length > 0) {
+            return replaceMessage(chatId, userId, "You have already claimed your daily sign-in bonus today. Come back tomorrow.", mainMenu);
+        }
+
+        await pool.query('UPDATE users SET balance = balance + 10 WHERE chat_id = $1', [userId]);
+        await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'signin_bonus', 10]);
+        
+        replaceMessage(chatId, userId, "Sign-in successful! 10 NGN has been added to your balance.", mainMenu);
+    }
+    else if (text === 'Top Referrers' || text === '/toprefs') {
+        if (await auditUser(userId)) return;
+        await trackUserActivity(msg, "Checked Leaderboard");
+
+        const res = await pool.query(`
+            SELECT u.username, COUNT(r.chat_id) as ref_count 
+            FROM users u 
+            JOIN users r ON r.referred_by = u.chat_id 
+            WHERE r.is_verified = TRUE 
+            GROUP BY u.chat_id, u.username 
+            ORDER BY ref_count DESC 
+            LIMIT 10
+        `);
+
+        if (res.rows.length === 0) {
+            return replaceMessage(chatId, userId, "The leaderboard is currently empty.", mainMenu);
+        }
+
+        let board = "Top 10 Referrers:\n\n";
+        res.rows.forEach((row, index) => {
+            const displayNick = isAdmin ? (row.username || 'Unknown') : maskUsername(row.username);
+            board += `${index + 1}. ${displayNick} - ${row.ref_count} invites\n`;
+        });
+
+        replaceMessage(chatId, userId, board, mainMenu);
+    }
+    else if (text === 'Invite Dashboard') {
+        if (await auditUser(userId)) return;
+        await trackUserActivity(msg, "Opened Invite Dashboard");
         
         bot.getMe().then(async (botInfo) => {
             const inviteLink = `https://t.me/${botInfo.username}?start=${userId}`;
@@ -451,65 +384,40 @@ bot.on('callback_query', async (query) => {
                 });
             }
 
-            sendOrEdit(chatId, userId, dashMsg, {
-                reply_markup: { inline_keyboard: [[{ text: 'Back to Menu', callback_data: 'menu_main' }]] }
-            });
+            replaceMessage(chatId, userId, dashMsg, mainMenu);
         });
-        return;
-    }
-
-    if (data === 'menu_balance') {
-        bot.answerCallbackQuery(query.id);
+    } 
+    else if (text === 'Balance') {
         if (await auditUser(userId)) return;
-        await trackUserActivity(query.message, "Checked Balance");
+        await trackUserActivity(msg, "Checked Balance");
         const balanceRes = await pool.query('SELECT balance, bank_name, account_number FROM users WHERE chat_id = $1', [userId]);
         
         if (balanceRes.rows.length > 0) {
             const user = balanceRes.rows[0];
             const bankStatus = user.bank_name ? `${user.bank_name} (${user.account_number})` : "Not Set";
             
-            const balMenu = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: 'Withdraw Funds', callback_data: 'action_withdraw' }],
-                        [{ text: 'Set Bank Details', callback_data: 'action_setbank' }],
-                        [{ text: 'Back to Menu', callback_data: 'menu_main' }]
-                    ]
-                }
-            };
-            sendOrEdit(chatId, userId, `Your Wallet\n\nBalance: ${user.balance.toLocaleString()} NGN\nBank Info: ${bankStatus}`, balMenu);
+            replaceMessage(chatId, userId, `Your Wallet\n\nBalance: ${user.balance.toLocaleString()} NGN\nBank Info: ${bankStatus}\n\nTo withdraw, send /withdraw\nTo update bank, send /setbank`, mainMenu);
         }
-        return;
-    }
-
-    if (data === 'action_setbank') {
-        bot.answerCallbackQuery(query.id);
-        let state = userStates.get(userId) || {};
+    } 
+    else if (text === '/setbank') {
         state.step = 'AWAITING_BANK_NAME';
         userStates.set(userId, state);
-        return sendOrEdit(chatId, userId, "Please type your Bank Name below:", cancelInlineMenu);
+        replaceMessage(chatId, userId, "Please type your Bank Name below:", cancelMenu);
     }
-
-    if (data === 'action_withdraw') {
-        bot.answerCallbackQuery(query.id);
+    else if (text === '/withdraw') {
         const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
         const user = res.rows[0];
         if (!user.bank_name || !user.account_name || !user.account_number) {
-            return sendOrEdit(chatId, userId, "You have not set your bank info yet. Please click 'Set Bank Details' first.", {
-                reply_markup: { inline_keyboard: [[{ text: 'Back', callback_data: 'menu_balance' }]] }
-            });
+            return replaceMessage(chatId, userId, "You have not set your bank info yet. Please send /setbank first.", mainMenu);
         }
-        let state = userStates.get(userId) || {};
         state.step = 'AWAITING_WITHDRAW_AMOUNT';
         state.user = user;
         userStates.set(userId, state);
-        return sendOrEdit(chatId, userId, `Type the amount you want to withdraw (Min: ${process.env.MIN_WITHDRAW || 500} NGN):`, cancelInlineMenu);
+        replaceMessage(chatId, userId, `Type the amount you want to withdraw (Min: ${process.env.MIN_WITHDRAW || 500} NGN):`, cancelMenu);
     }
-
-    if (data === 'menu_records') {
-        bot.answerCallbackQuery(query.id);
+    else if (text === 'Records' || text === '/records') {
         if (await auditUser(userId)) return;
-        await trackUserActivity(query.message, "Checked Records");
+        await trackUserActivity(msg, "Checked Records");
 
         const res = await pool.query('SELECT type, amount, status, created_at FROM transactions WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 10', [userId]);
         
@@ -523,20 +431,21 @@ bot.on('callback_query', async (query) => {
             });
         }
 
-        return sendOrEdit(chatId, userId, recordMsg, {
-            reply_markup: { inline_keyboard: [[{ text: 'Back to Menu', callback_data: 'menu_main' }]] }
-        });
+        replaceMessage(chatId, userId, recordMsg, mainMenu);
     }
-
-    if (data === 'menu_support') {
-        bot.answerCallbackQuery(query.id);
-        await trackUserActivity(query.message, "Clicked Support");
-        return sendOrEdit(chatId, userId, `For any inquiries, please contact ${process.env.SUPPORT_USERNAME}`, {
-            reply_markup: { inline_keyboard: [[{ text: 'Back to Menu', callback_data: 'menu_main' }]] }
-        });
+    else if (text === 'Support') {
+        await trackUserActivity(msg, "Clicked Support");
+        replaceMessage(chatId, userId, `For any inquiries, please contact ${process.env.SUPPORT_USERNAME}`, mainMenu);
     }
+});
 
-    // --- VERIFICATION & ADMIN CALLBACKS ---
+bot.on('callback_query', async (query) => {
+    const userId = query.from.id;
+    const chatId = query.message.chat.id;
+    const data = query.data;
+
+    if (!(await isUserAllowed(userId))) return bot.answerCallbackQuery(query.id);
+
     if (data === 'verify_join') {
         await trackUserActivity(query.message, "Clicked Verify Join");
         const username = query.from.username ? `@${query.from.username}` : null;
@@ -556,7 +465,7 @@ bot.on('callback_query', async (query) => {
                 bot.sendMessage(referrer, `Your referral has been verified! You earned ${refReward.toLocaleString()} NGN.`).catch(()=>{});
             }
             bot.answerCallbackQuery(query.id, { text: "Verification successful!" });
-            return sendOrEdit(chatId, userId, "Verification successful! You received a 100 NGN welcome bonus.", mainInlineMenu);
+            return replaceMessage(chatId, userId, "Verification successful! You received a 100 NGN welcome bonus.", mainMenu);
         } else {
             return bot.answerCallbackQuery(query.id, { text: "You haven't joined the required group yet. Please join and try again.", show_alert: true });
         }
