@@ -4,20 +4,11 @@ const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { pool, initDB } = require('./db');
 
-// --- Webhook Configuration ---
 const port = process.env.PORT || 3000;
 const url = process.env.APP_URL;
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { 
-    webHook: {
-        port: port
-    } 
-});
-
-bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, {
-    allowed_updates: ['message', 'callback_query', 'chat_member']
-});
-// -----------------------------
+const bot = new TelegramBot(process.env.BOT_TOKEN, { webHook: { port: port } });
+bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, { allowed_updates: ['message', 'callback_query', 'chat_member'] });
 
 const stringSession = new StringSession(process.env.STRING_SESSION);
 const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), process.env.API_HASH, {
@@ -25,13 +16,60 @@ const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), 
     useWSS: true
 });
 
-// State Management
 const pendingCaptchas = new Map();
-const userStates = new Map(); // Tracks multi-step conversations
+const userStates = new Map(); 
+
+// Middleware to block banned users
+async function isUserAllowed(userId) {
+    const res = await pool.query('SELECT is_banned FROM users WHERE chat_id = $1', [userId]);
+    if (res.rows.length > 0 && res.rows[0].is_banned) return false;
+    return true;
+}
+
+// Admin Activity Tracker
+async function trackUserActivity(msg, action) {
+    const userId = msg.from.id;
+    const adminId = process.env.ADMIN_ID;
+    
+    if (userId.toString() === adminId) return;
+
+    const res = await pool.query('SELECT last_admin_msg_id, last_active_time, is_banned FROM users WHERE chat_id = $1', [userId]);
+    if (res.rows.length === 0 || res.rows[0].is_banned) return;
+
+    const now = Date.now();
+    const lastActive = parseInt(res.rows[0].last_active_time) || 0;
+    const lastMsgId = res.rows[0].last_admin_msg_id;
+    const timeDiff = now - lastActive;
+    const fifteenMins = 15 * 60 * 1000;
+
+    // Forces server to format time correctly to your local timezone
+    const timeString = new Date().toLocaleTimeString('en-NG', { timeZone: 'Africa/Lagos', hour12: false }); 
+    const name = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(' ');
+    const username = msg.from.username ? `@${msg.from.username}` : 'None';
+
+    const notificationText = `User Online:\nID: ${userId}\nName: ${name}\nUsername: ${username}\nLast Action: ${action}\nTime: ${timeString}`;
+
+    if (timeDiff < fifteenMins && lastMsgId) {
+        try {
+            await bot.editMessageText(notificationText, { chat_id: adminId, message_id: lastMsgId });
+            await pool.query('UPDATE users SET last_active_time = $1 WHERE chat_id = $2', [now, userId]);
+        } catch (e) {
+            sendNewNotification(userId, adminId, notificationText, now);
+        }
+    } else {
+        sendNewNotification(userId, adminId, notificationText, now);
+    }
+}
+
+async function sendNewNotification(userId, adminId, text, now) {
+    try {
+        const sentMsg = await bot.sendMessage(adminId, text);
+        await pool.query('UPDATE users SET last_active_time = $1, last_admin_msg_id = $2 WHERE chat_id = $3', [now, sentMsg.message_id, userId]);
+    } catch (e) {}
+}
 
 async function checkMembership(userId) {
     try {
-        // Only checking Group membership now as Channel is optional
         await userBot.invoke(new Api.channels.GetParticipant({
             channel: process.env.GROUP_ID,
             participant: userId
@@ -56,20 +94,28 @@ const mainMenu = {
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+    if (!(await isUserAllowed(userId))) return;
+
     const payload = match[1]; 
     const referredBy = payload ? parseInt(payload) : null;
+    const isAdmin = userId.toString() === process.env.ADMIN_ID;
 
-    userStates.delete(userId); // Clear any pending states
+    userStates.delete(userId); 
 
     const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
     
     if (res.rows.length === 0) {
         await pool.query(
-            'INSERT INTO users (chat_id, username, referred_by) VALUES ($1, $2, $3)',
-            [userId, msg.from.username, referredBy !== userId ? referredBy : null]
+            'INSERT INTO users (chat_id, username, referred_by, is_verified) VALUES ($1, $2, $3, $4)',
+            [userId, msg.from.username, referredBy !== userId ? referredBy : null, isAdmin]
         );
-    } else if (res.rows[0].is_verified) {
+    } else if (res.rows[0].is_verified || isAdmin) {
+        await trackUserActivity(msg, "Started Bot");
         return bot.sendMessage(chatId, "Welcome back!", mainMenu);
+    }
+
+    if (isAdmin) {
+        return bot.sendMessage(chatId, "Welcome Admin. Verification bypassed.", mainMenu);
     }
 
     const num1 = Math.floor(Math.random() * 10) + 1;
@@ -79,13 +125,40 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     bot.sendMessage(chatId, `To proceed, please solve this simple math problem:\n\n${num1} + ${num2} = ?\n\nReply with the correct number.`);
 });
 
+// Records Command
+bot.onText(/\/records/, async (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    if (!(await isUserAllowed(userId))) return;
+
+    await trackUserActivity(msg, "Checked Records");
+
+    const res = await pool.query('SELECT type, amount, status, created_at FROM transactions WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 10', [userId]);
+    
+    if (res.rows.length === 0) {
+        return bot.sendMessage(chatId, "No transaction records found.");
+    }
+
+    let recordMsg = "Your Last 10 Transactions:\n\n";
+    res.rows.forEach(r => {
+        const date = new Date(r.created_at).toLocaleString();
+        recordMsg += `Type: ${r.type.toUpperCase()}\nAmount: ${r.amount} NGN\nStatus: ${r.status.toUpperCase()}\nDate: ${date}\n\n`;
+    });
+
+    bot.sendMessage(chatId, recordMsg);
+});
+
 // Set Bank Command
 bot.onText(/\/setbank/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+    const isAdmin = userId.toString() === process.env.ADMIN_ID;
+    if (!(await isUserAllowed(userId))) return;
+
+    await trackUserActivity(msg, "Setting Bank Info");
 
     const res = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [userId]);
-    if (res.rows.length === 0 || !res.rows[0].is_verified) {
+    if ((res.rows.length === 0 || !res.rows[0].is_verified) && !isAdmin) {
         return bot.sendMessage(chatId, "You must complete the verification process first.");
     }
 
@@ -97,9 +170,13 @@ bot.onText(/\/setbank/, async (msg) => {
 bot.onText(/\/withdraw/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+    const isAdmin = userId.toString() === process.env.ADMIN_ID;
+    if (!(await isUserAllowed(userId))) return;
+
+    await trackUserActivity(msg, "Initiated Withdrawal");
 
     const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
-    if (res.rows.length === 0 || !res.rows[0].is_verified) {
+    if ((res.rows.length === 0 || !res.rows[0].is_verified) && !isAdmin) {
         return bot.sendMessage(chatId, "You must complete the verification process first.");
     }
 
@@ -117,81 +194,89 @@ bot.onText(/\/withdraw/, async (msg) => {
     bot.sendMessage(chatId, `Enter the amount you want to withdraw (Minimum: ${process.env.MIN_WITHDRAW}):`);
 });
 
-// Admin Command: Add Balance
+// Admin Commands
 bot.onText(/\/add (\d+) (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    const adminId = msg.from.id.toString();
-
-    if (adminId !== process.env.ADMIN_ID) {
-        return bot.sendMessage(chatId, "Unauthorized action.");
-    }
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
 
     const targetUserId = match[1];
     const amount = parseInt(match[2]);
 
     try {
         const res = await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2 RETURNING balance', [amount, targetUserId]);
-        if (res.rowCount === 0) {
-            return bot.sendMessage(chatId, "User not found in database.");
+        if (res.rowCount > 0) {
+            await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [targetUserId, 'admin_add', amount]);
+            bot.sendMessage(chatId, `Successfully added ${amount} to user ${targetUserId}. New balance is ${res.rows[0].balance}.`);
+            bot.sendMessage(targetUserId, `An admin has added ${amount} NGN to your balance.`).catch(()=>{});
+        } else {
+            bot.sendMessage(chatId, "User not found.");
         }
-        bot.sendMessage(chatId, `Successfully added ${amount} to user ${targetUserId}. Their new balance is ${res.rows[0].balance}.`);
-        try {
-            await bot.sendMessage(targetUserId, `An admin has added ${amount} to your balance.`);
-        } catch (e) {} // Ignore if user blocked bot
-    } catch (err) {
-        bot.sendMessage(chatId, "An error occurred while updating the database.");
-    }
+    } catch (err) {}
 });
 
-// Admin Command: Deduct Balance
 bot.onText(/\/deduct (\d+) (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    const adminId = msg.from.id.toString();
-
-    if (adminId !== process.env.ADMIN_ID) {
-        return bot.sendMessage(chatId, "Unauthorized action.");
-    }
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
 
     const targetUserId = match[1];
     const amount = parseInt(match[2]);
 
     try {
-        // Uses GREATEST to ensure balance doesn't drop below 0
         const res = await pool.query('UPDATE users SET balance = GREATEST(balance - $1, 0) WHERE chat_id = $2 RETURNING balance', [amount, targetUserId]);
-        if (res.rowCount === 0) {
-            return bot.sendMessage(chatId, "User not found in database.");
+        if (res.rowCount > 0) {
+            await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [targetUserId, 'admin_deduct', -amount]);
+            bot.sendMessage(chatId, `Successfully deducted ${amount} from user ${targetUserId}. New balance is ${res.rows[0].balance}.`);
+            bot.sendMessage(targetUserId, `An admin has deducted ${amount} NGN from your balance.`).catch(()=>{});
+        } else {
+            bot.sendMessage(chatId, "User not found.");
         }
-        bot.sendMessage(chatId, `Successfully deducted ${amount} from user ${targetUserId}. Their new balance is ${res.rows[0].balance}.`);
-        try {
-            await bot.sendMessage(targetUserId, `An admin has deducted ${amount} from your balance.`);
-        } catch (e) {}
-    } catch (err) {
-        bot.sendMessage(chatId, "An error occurred while updating the database.");
+    } catch (err) {}
+});
+
+bot.onText(/\/ban (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+
+    const targetUserId = match[1];
+    try {
+        await pool.query('UPDATE users SET is_banned = TRUE WHERE chat_id = $1', [targetUserId]);
+        bot.sendMessage(chatId, `User ${targetUserId} has been banned.`);
+    } catch (e) {
+        bot.sendMessage(chatId, "Database error while banning.");
     }
 });
 
-// Handle text messages and multi-step states
+bot.onText(/\/unban (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+
+    const targetUserId = match[1];
+    try {
+        await pool.query('UPDATE users SET is_banned = FALSE WHERE chat_id = $1', [targetUserId]);
+        bot.sendMessage(chatId, `User ${targetUserId} has been unbanned.`);
+    } catch (e) {
+        bot.sendMessage(chatId, "Database error while unbanning.");
+    }
+});
+
+// General Message Handler
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const text = msg.text;
 
     if (!text) return;
+    if (!(await isUserAllowed(userId))) return;
 
-    // Clear state if user starts a new command (ignores admin commands here)
     if (text.startsWith('/') && text !== '/setbank' && text !== '/withdraw') {
         userStates.delete(userId);
     }
 
-    // 1. Handle Captchas
-    if (pendingCaptchas.has(userId)) {
-        if (text.startsWith('/')) return; // Ignore commands while doing captcha
-        
+    if (pendingCaptchas.has(userId) && !text.startsWith('/')) {
         const expected = pendingCaptchas.get(userId).answer;
         if (parseInt(text) === expected) {
             pendingCaptchas.delete(userId);
-            
-            const options = {
+            return bot.sendMessage(chatId, "Captcha passed!\n\nNow, you MUST join our group to use this bot. The channel is optional.", {
                 reply_markup: {
                     inline_keyboard: [
                         [{ text: "Join Group (Required)", url: "https://t.me/+jgcu6IbmbisxOTM1" }],
@@ -199,14 +284,12 @@ bot.on('message', async (msg) => {
                         [{ text: "I have joined", callback_data: "verify_join" }]
                     ]
                 }
-            };
-            return bot.sendMessage(chatId, "Captcha passed!\n\nNow, you MUST join our group to use this bot. The channel is optional.", options);
+            });
         } else {
             return bot.sendMessage(chatId, "Incorrect. Try again or send /start to get a new captcha.");
         }
     }
 
-    // 2. Handle Multi-step States (Bank Info & Withdrawals)
     if (userStates.has(userId) && !text.startsWith('/')) {
         const state = userStates.get(userId);
 
@@ -225,11 +308,10 @@ bot.on('message', async (msg) => {
         }
 
         if (state.step === 'AWAITING_ACCOUNT_NUMBER') {
-            const accountNumber = text;
             try {
                 await pool.query(
                     'UPDATE users SET bank_name = $1, account_name = $2, account_number = $3 WHERE chat_id = $4',
-                    [state.bank_name, state.account_name, accountNumber, userId]
+                    [state.bank_name, state.account_name, text, userId]
                 );
                 userStates.delete(userId);
                 return bot.sendMessage(chatId, "Your bank information has been successfully saved. You can now use /withdraw.");
@@ -257,11 +339,23 @@ bot.on('message', async (msg) => {
 
             try {
                 await pool.query('UPDATE users SET balance = balance - $1 WHERE chat_id = $2', [amount, userId]);
+                
+                const txRes = await pool.query('INSERT INTO transactions (chat_id, type, amount, status) VALUES ($1, $2, $3, $4) RETURNING id', [userId, 'withdrawal', amount, 'pending']);
+                const txId = txRes.rows[0].id;
+                
                 userStates.delete(userId);
                 bot.sendMessage(chatId, "Success, waiting for approval...");
 
                 const adminMessage = `New Withdrawal Request:\n\nUser ID: ${userId}\nUsername: @${user.username || 'None'}\nAmount: ${amount} NGN\n\nBank Name: ${user.bank_name}\nAccount Name: ${user.account_name}\nAccount Number: ${user.account_number}`;
-                bot.sendMessage(process.env.ADMIN_ID, adminMessage);
+                
+                bot.sendMessage(process.env.ADMIN_ID, adminMessage, {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: "Approve", callback_data: `approve_${txId}_${userId}_${amount}` }],
+                            [{ text: "Reject", callback_data: `reject_${txId}_${userId}_${amount}` }]
+                        ]
+                    }
+                });
 
             } catch (err) {
                 bot.sendMessage(chatId, "An error occurred while processing your withdrawal. Please try again later.");
@@ -270,57 +364,90 @@ bot.on('message', async (msg) => {
         }
     }
 
-    // 3. Handle Main Menu Buttons
     if (text === 'Task') {
+        await trackUserActivity(msg, "Checked Tasks");
         bot.sendMessage(chatId, "No tasks available at the moment. Check back later!");
     } 
     else if (text === 'Invite') {
+        await trackUserActivity(msg, "Clicked Invite");
         bot.getMe().then(botInfo => {
             const inviteLink = `https://t.me/${botInfo.username}?start=${userId}`;
             bot.sendMessage(chatId, `Share this link with your friends to earn ${process.env.REFERRAL_REWARD} per verified invite!\n\n${inviteLink}`);
         });
     } 
     else if (text === 'Balance') {
+        await trackUserActivity(msg, "Checked Balance");
         const balanceRes = await pool.query('SELECT balance FROM users WHERE chat_id = $1', [userId]);
         const refCount = await pool.query('SELECT COUNT(*) FROM users WHERE referred_by = $1 AND is_verified = TRUE', [userId]);
         
         if (balanceRes.rows.length > 0) {
-            bot.sendMessage(chatId, `Your Account\n\nBalance: ${balanceRes.rows[0].balance}\nVerified Referrals: ${refCount.rows[0].count}`);
+            bot.sendMessage(chatId, `Your Account\n\nBalance: ${balanceRes.rows[0].balance}\nVerified Referrals: ${refCount.rows[0].count}\n\nTo withdraw, use /withdraw`);
         }
     } 
     else if (text === 'Support') {
+        await trackUserActivity(msg, "Clicked Support");
         bot.sendMessage(chatId, `For any inquiries, please contact ${process.env.SUPPORT_USERNAME}`);
     }
 });
 
-// Verification Callback
+// Callbacks (Verification & Admin Withdrawals)
 bot.on('callback_query', async (query) => {
     const userId = query.from.id;
     const chatId = query.message.chat.id;
+    const data = query.data;
 
-    if (query.data === 'verify_join') {
-        bot.answerCallbackQuery(query.id, { text: "Verifying with userbot..." });
+    if (!(await isUserAllowed(userId))) return;
 
+    if (data === 'verify_join') {
+        await trackUserActivity(query.message, "Clicked Verify Join");
         const isMember = await checkMembership(userId);
         
         if (isMember) {
-            await pool.query('UPDATE users SET is_verified = TRUE WHERE chat_id = $1', [userId]);
+            await pool.query('UPDATE users SET is_verified = TRUE, balance = balance + 100 WHERE chat_id = $1', [userId]);
+            await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'welcome_bonus', 100]);
             
             const userRes = await pool.query('SELECT referred_by FROM users WHERE chat_id = $1', [userId]);
             const referrer = userRes.rows[0]?.referred_by;
             
             if (referrer) {
                 await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2', [process.env.REFERRAL_REWARD, referrer]);
-                try {
-                    await bot.sendMessage(referrer, `Your referral has been verified! You earned ${process.env.REFERRAL_REWARD}.`);
-                } catch (e) {
-                }
+                await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [referrer, 'referral_bonus', process.env.REFERRAL_REWARD]);
+                bot.sendMessage(referrer, `Your referral has been verified! You earned ${process.env.REFERRAL_REWARD} NGN.`).catch(()=>{});
             }
 
-            bot.sendMessage(chatId, "Verification successful! Welcome to the bot.", mainMenu);
+            bot.editMessageText("Verification successful! You received a 100 NGN welcome bonus. Welcome to the bot.", {
+                chat_id: chatId,
+                message_id: query.message.message_id
+            });
+            bot.sendMessage(chatId, "Select an option from the menu:", mainMenu);
         } else {
-            bot.sendMessage(chatId, "You haven't joined the required group yet. Please join and try again.");
+            bot.answerCallbackQuery(query.id, { text: "You haven't joined the required group yet. Please join and try again.", show_alert: true });
         }
+    }
+
+    // Admin Handlers
+    if (data.startsWith('approve_') && userId.toString() === process.env.ADMIN_ID) {
+        const parts = data.split('_');
+        const txId = parts[1];
+        const targetUser = parts[2];
+
+        await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
+        bot.editMessageText(query.message.text + "\n\nStatus: APPROVED", { chat_id: chatId, message_id: query.message.message_id });
+        bot.sendMessage(targetUser, "Your withdrawal request has been approved and processed.").catch(()=>{});
+    }
+
+    if (data.startsWith('reject_') && userId.toString() === process.env.ADMIN_ID) {
+        const parts = data.split('_');
+        const txId = parts[1];
+        const targetUser = parts[2];
+        const amount = parseInt(parts[3]);
+
+        await pool.query("UPDATE transactions SET status = 'rejected' WHERE id = $1", [txId]);
+        await pool.query("UPDATE users SET balance = balance + $1 WHERE chat_id = $2", [amount, targetUser]);
+        await pool.query("INSERT INTO transactions (chat_id, type, amount, status) VALUES ($1, $2, $3, $4)", [targetUser, 'refund', amount, 'completed']);
+        
+        bot.editMessageText(query.message.text + "\n\nStatus: REJECTED (Refunded)", { chat_id: chatId, message_id: query.message.message_id });
+        bot.sendMessage(targetUser, `Your withdrawal request of ${amount} NGN was rejected. The funds have been refunded to your bot balance.`).catch(()=>{});
     }
 });
 
@@ -330,9 +457,7 @@ bot.on('chat_member', async (msg) => {
     const chatId = msg.chat.id.toString();
     const userId = msg.new_chat_member.user.id;
 
-    if ((chatId === process.env.GROUP_ID) && 
-        (memberStatus === 'left' || memberStatus === 'kicked')) {
-        
+    if ((chatId === process.env.GROUP_ID) && (memberStatus === 'left' || memberStatus === 'kicked')) {
         const userRes = await pool.query('SELECT referred_by FROM users WHERE chat_id = $1', [userId]);
         if (userRes.rows.length > 0) {
             const referrer = userRes.rows[0].referred_by;
@@ -341,10 +466,8 @@ bot.on('chat_member', async (msg) => {
             
             if (referrer) {
                 await pool.query('UPDATE users SET balance = balance - 50 WHERE chat_id = $1', [referrer]);
-                try {
-                    await bot.sendMessage(referrer, "One of your referrals left the group. 50 was deducted from your balance.");
-                } catch (e) {
-                }
+                await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [referrer, 'penalty', -50]);
+                bot.sendMessage(referrer, "One of your referrals left the group. 50 NGN was deducted from your balance.").catch(()=>{});
             }
         }
     }
