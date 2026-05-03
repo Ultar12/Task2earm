@@ -21,7 +21,6 @@ const userStates = new Map();
 let resolvedGroupEntity = null; 
 
 // --- HELPER: CLEAN UI ENGINE (Standard Keyboard Version) ---
-// Deletes the bot's old message and sends a new one so the chat stays clean
 async function replaceMessage(chatId, userId, text, options = {}) {
     const state = userStates.get(userId) || {};
     
@@ -171,8 +170,9 @@ bot.on('message', async (msg) => {
 
     if (!text) return;
 
-    // Instantly delete the user's message to keep the chat clean
-    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    if (!text.startsWith('/start')) {
+        bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+    }
 
     if (!(await isUserAllowed(userId))) return;
 
@@ -190,8 +190,7 @@ bot.on('message', async (msg) => {
         const referredBy = payload ? parseInt(payload) : null;
         
         state.step = null;
-        userStates.set(userId, state);
-
+        
         const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
         
         if (res.rows.length === 0) {
@@ -201,18 +200,27 @@ bot.on('message', async (msg) => {
             );
         } else if (res.rows[0].is_verified || isAdmin) {
             await trackUserActivity(msg, "Started Bot");
-            return replaceMessage(chatId, userId, "Welcome back to your dashboard.", mainMenu);
+            bot.sendMessage(chatId, "Welcome back to your dashboard.", mainMenu);
+            state.lastBotMsgId = null; 
+            userStates.set(userId, state);
+            return;
         }
 
         if (isAdmin) {
-            return replaceMessage(chatId, userId, "Welcome Admin. Verification bypassed.", mainMenu);
+            bot.sendMessage(chatId, "Welcome Admin. Verification bypassed.", mainMenu);
+            state.lastBotMsgId = null;
+            userStates.set(userId, state);
+            return;
         }
 
         const num1 = Math.floor(Math.random() * 10) + 1;
         const num2 = Math.floor(Math.random() * 10) + 1;
         pendingCaptchas.set(userId, { answer: num1 + num2, referredBy });
 
-        return replaceMessage(chatId, userId, `To proceed, please solve this simple math problem:\n\n${num1} + ${num2} = ?\n\nType the correct number below.`);
+        bot.sendMessage(chatId, `To proceed, please solve this simple math problem:\n\n${num1} + ${num2} = ?\n\nType the correct number below.`);
+        state.lastBotMsgId = null;
+        userStates.set(userId, state);
+        return;
     }
 
     if (pendingCaptchas.has(userId)) {
@@ -315,15 +323,25 @@ bot.on('message', async (msg) => {
     if (text === 'Task') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Checked Tasks");
-        replaceMessage(chatId, userId, "Task Center:\n\n1. /signin - Claim 10 NGN daily.\n(Note: You must have at least 1 verified referral to use this).", mainMenu);
+        replaceMessage(chatId, userId, "Task Center:\n\n1. /signin - Claim 100 NGN daily.\n(Note: You must have at least 10 verified referrals TODAY to unlock this).", mainMenu);
     } 
     else if (text === '/signin') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Attempted Sign-in");
 
-        const refCheck = await pool.query('SELECT COUNT(*) FROM users WHERE referred_by = $1 AND is_verified = TRUE', [userId]);
-        if (parseInt(refCheck.rows[0].count) === 0) {
-            return replaceMessage(chatId, userId, "You cannot sign in yet. You must have at least 1 verified referral to unlock daily sign-ins.", mainMenu);
+        // --- NEW RULE: 10 Valid Referrals TODAY ---
+        const todayRefCheck = await pool.query(
+            `SELECT COUNT(*) FROM users 
+             WHERE referred_by = $1 
+             AND is_verified = TRUE 
+             AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`, 
+            [userId]
+        );
+        
+        const refsToday = parseInt(todayRefCheck.rows[0].count);
+
+        if (refsToday < 10) {
+            return replaceMessage(chatId, userId, `You cannot sign in yet. You need at least 10 verified referrals TODAY to unlock daily sign-ins.\n\nYour valid referrals today: ${refsToday}/10`, mainMenu);
         }
 
         const todayCheck = await pool.query(`SELECT id FROM transactions WHERE chat_id = $1 AND type = 'signin_bonus' AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`, [userId]);
@@ -331,10 +349,10 @@ bot.on('message', async (msg) => {
             return replaceMessage(chatId, userId, "You have already claimed your daily sign-in bonus today. Come back tomorrow.", mainMenu);
         }
 
-        await pool.query('UPDATE users SET balance = balance + 10 WHERE chat_id = $1', [userId]);
-        await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'signin_bonus', 10]);
+        await pool.query('UPDATE users SET balance = balance + 100 WHERE chat_id = $1', [userId]);
+        await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'signin_bonus', 100]);
         
-        replaceMessage(chatId, userId, "Sign-in successful! 10 NGN has been added to your balance.", mainMenu);
+        replaceMessage(chatId, userId, "Sign-in successful! 100 NGN has been added to your balance.", mainMenu);
     }
     else if (text === 'Top Referrers' || text === '/toprefs') {
         if (await auditUser(userId)) return;
