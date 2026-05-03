@@ -74,7 +74,6 @@ async function checkMembership(userId) {
         }
 
         try {
-            // 1. Try standard lookup (uses local GramJS cache)
             await userBot.invoke(new Api.channels.GetParticipant({
                 channel: resolvedGroupEntity,
                 participant: userId
@@ -82,7 +81,6 @@ async function checkMembership(userId) {
             return true; 
             
         } catch (innerErr) {
-            // 2. If GramJS cache fails, force the request to Telegram bypassing the cache
             if (String(innerErr).includes("Could not find the input entity")) {
                 await userBot.invoke(new Api.channels.GetParticipant({
                     channel: resolvedGroupEntity,
@@ -90,23 +88,26 @@ async function checkMembership(userId) {
                 }));
                 return true;
             }
-            throw innerErr; // Re-throw other API errors to the outer catch
+            throw innerErr; 
         }
         
     } catch (e) {
         const errStr = String(e.message || e.className || "").toUpperCase();
         
-        // 3. STRICT CHECK: Only penalize if Telegram explicitly says they are not a participant.
-        if (errStr.includes('USER_NOT_PARTICIPANT')) {
+        // STRICT CHECK: Now includes PARTICIPANT_ID_INVALID
+        if (errStr.includes('USER_NOT_PARTICIPANT') || errStr.includes('PARTICIPANT_ID_INVALID')) {
             return false; 
         }
 
-        // 4. SAFE FALLBACK: For ALL other errors (Rate limits, Peer IDs, missing caches), 
-        // assume true to protect the user's account from being falsely wiped.
+        if (e.code === 420 || errStr.includes('FLOOD')) {
+            return true; 
+        }
+
         console.log(`[Safe Fallback for ${userId}]:`, e.message || e.className);
         return true; 
     }
 }
+
 
 
 async function auditUser(userId) {
