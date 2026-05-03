@@ -66,47 +66,65 @@ async function sendNewNotification(userId, adminId, text, now) {
     } catch (e) {}
 }
 
-async function checkMembership(userId) {
+// We now pass the username into the function as a backup strategy
+async function checkMembership(userId, username = null) {
     try {
         if (!resolvedGroupEntity) {
-            console.log("Verification failed: Group entity is missing.");
+            console.log("[Verification] Group entity is missing.");
             return false;
         }
 
+        // STRATEGY 1: The "Recent Members" Scrape (Best for new joins & hidden members)
+        try {
+            // Pulls the 100 newest members from the group
+            const recentMembers = await userBot.getParticipants(resolvedGroupEntity, { limit: 100 });
+            
+            // Search the list for the user's exact ID
+            const foundInRecent = recentMembers.find(m => m.id.toString() === userId.toString());
+            
+            if (foundInRecent) {
+                console.log(`[Verification] Found ${userId} in recent members list!`);
+                return true; 
+            }
+        } catch (scrapeErr) {
+            console.log("[Verification] Recent members scrape failed:", scrapeErr.message);
+        }
+
+        // STRATEGY 2: The Username Lookup (Best for auditing older members)
+        let targetEntity = null;
+        if (username && username !== 'None') {
+            try {
+                // This forces Telegram to give the UserBot the user's access_hash!
+                targetEntity = await userBot.getEntity(username);
+            } catch (err) {
+                // Ignore if username changed or is invalid
+            }
+        }
+
+        // STRATEGY 3: The Direct API Query
         try {
             await userBot.invoke(new Api.channels.GetParticipant({
                 channel: resolvedGroupEntity,
-                participant: userId
+                participant: targetEntity ? targetEntity : userId
             }));
-            return true; 
+            return true; // Found them!
+        } catch (apiErr) {
+            const errStr = String(apiErr.message || apiErr.className || "").toUpperCase();
             
-        } catch (innerErr) {
-            if (String(innerErr).includes("Could not find the input entity")) {
-                await userBot.invoke(new Api.channels.GetParticipant({
-                    channel: resolvedGroupEntity,
-                    participant: new Api.InputPeerUser({ userId: BigInt(userId), accessHash: BigInt(0) })
-                }));
-                return true;
+            if (errStr.includes('USER_NOT_PARTICIPANT') || errStr.includes('PARTICIPANT_ID_INVALID') || errStr.includes('INPUT_ENTITY')) {
+                return false; 
             }
-            throw innerErr; 
+            if (apiErr.code === 420 || errStr.includes('FLOOD')) {
+                return true; // Safe fallback if Telegram is rate-limiting the UserBot
+            }
+            throw apiErr;
         }
         
     } catch (e) {
-        const errStr = String(e.message || e.className || "").toUpperCase();
-        
-        // STRICT CHECK: Now includes PARTICIPANT_ID_INVALID
-        if (errStr.includes('USER_NOT_PARTICIPANT') || errStr.includes('PARTICIPANT_ID_INVALID')) {
-            return false; 
-        }
-
-        if (e.code === 420 || errStr.includes('FLOOD')) {
-            return true; 
-        }
-
-        console.log(`[Safe Fallback for ${userId}]:`, e.message || e.className);
-        return true; 
+        return false; 
     }
 }
+
 
 
 
@@ -496,9 +514,15 @@ bot.on('callback_query', async (query) => {
 
     if (!(await isUserAllowed(userId))) return;
 
-    if (data === 'verify_join') {
+        if (data === 'verify_join') {
         await trackUserActivity(query.message, "Clicked Verify Join");
-        const isMember = await checkMembership(userId);
+        
+        // Grab their username right from the button click
+        const username = query.from.username ? `@${query.from.username}` : null;
+        
+        // Pass it to the function
+        const isMember = await checkMembership(userId, username);
+        
         
         if (isMember) {
             await pool.query('UPDATE users SET is_verified = TRUE, balance = balance + 100 WHERE chat_id = $1', [userId]);
