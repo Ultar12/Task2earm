@@ -73,20 +73,41 @@ async function checkMembership(userId) {
             return false;
         }
 
-        await userBot.invoke(new Api.channels.GetParticipant({
-            channel: resolvedGroupEntity,
-            participant: userId
-        }));
-        return true; 
-    } catch (e) {
-        if (e.code === 420 || String(e).toUpperCase().includes('FLOOD')) {
+        try {
+            // 1. Try standard lookup (uses local GramJS cache)
+            await userBot.invoke(new Api.channels.GetParticipant({
+                channel: resolvedGroupEntity,
+                participant: userId
+            }));
             return true; 
+            
+        } catch (innerErr) {
+            // 2. If GramJS cache fails, force the request to Telegram bypassing the cache
+            if (String(innerErr).includes("Could not find the input entity")) {
+                await userBot.invoke(new Api.channels.GetParticipant({
+                    channel: resolvedGroupEntity,
+                    participant: new Api.InputPeerUser({ userId: BigInt(userId), accessHash: BigInt(0) })
+                }));
+                return true;
+            }
+            throw innerErr; // Re-throw other API errors to the outer catch
         }
         
-        console.log(`[Audit Failed for ${userId}]:`, e.message || e.className);
-        return false; 
+    } catch (e) {
+        const errStr = String(e.message || e.className || "").toUpperCase();
+        
+        // 3. STRICT CHECK: Only penalize if Telegram explicitly says they are not a participant.
+        if (errStr.includes('USER_NOT_PARTICIPANT')) {
+            return false; 
+        }
+
+        // 4. SAFE FALLBACK: For ALL other errors (Rate limits, Peer IDs, missing caches), 
+        // assume true to protect the user's account from being falsely wiped.
+        console.log(`[Safe Fallback for ${userId}]:`, e.message || e.className);
+        return true; 
     }
 }
+
 
 async function auditUser(userId) {
     if (userId.toString() === process.env.ADMIN_ID) return false;
