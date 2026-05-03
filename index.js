@@ -76,9 +76,18 @@ async function checkMembership(userId) {
         }));
         return true;
     } catch (e) {
-        if (e.message && e.message.includes('USER_NOT_PARTICIPANT')) {
+        // Protect against rate limit bans
+        if (e.code === 420 || String(e).toUpperCase().includes('FLOOD')) {
+            return true; 
+        }
+        
+        // Strict catch for any 400 error (Bad Request) or known participant invalidation strings
+        const errStr = String(e.message || e.className || "").toUpperCase();
+        if (e.code === 400 || errStr.includes('PARTICIPANT') || errStr.includes('INVALID') || errStr.includes('BANNED')) {
             return false;
         }
+        
+        // Default to true for unknown connection errors to avoid wiping users due to server hiccups
         return true; 
     }
 }
@@ -127,7 +136,6 @@ const cancelMenu = {
     }
 };
 
-// Start Command
 bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -164,12 +172,12 @@ bot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
     });
 });
 
-// Records Command
 bot.onText(/\/records/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     if (!(await isUserAllowed(userId))) return;
 
+    if (await auditUser(userId)) return;
     await trackUserActivity(msg, "Checked Records");
 
     const res = await pool.query('SELECT type, amount, status, created_at FROM transactions WHERE chat_id = $1 ORDER BY created_at DESC LIMIT 10', [userId]);
@@ -187,13 +195,13 @@ bot.onText(/\/records/, async (msg) => {
     bot.sendMessage(chatId, recordMsg);
 });
 
-// Set Bank Command
 bot.onText(/\/setbank/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const isAdmin = userId.toString() === process.env.ADMIN_ID;
     if (!(await isUserAllowed(userId))) return;
 
+    if (await auditUser(userId)) return;
     await trackUserActivity(msg, "Setting Bank Info");
 
     const res = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [userId]);
@@ -205,7 +213,6 @@ bot.onText(/\/setbank/, async (msg) => {
     bot.sendMessage(chatId, "Please enter your Bank Name:", cancelMenu);
 });
 
-// Withdraw Command
 bot.onText(/\/withdraw/, async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -213,7 +220,6 @@ bot.onText(/\/withdraw/, async (msg) => {
     if (!(await isUserAllowed(userId))) return;
 
     if (await auditUser(userId)) return;
-
     await trackUserActivity(msg, "Initiated Withdrawal");
 
     const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
@@ -237,7 +243,6 @@ bot.onText(/\/withdraw/, async (msg) => {
     bot.sendMessage(chatId, `Enter the amount you want to withdraw (Minimum: ${minWithdraw.toLocaleString()} NGN):`, cancelMenu);
 });
 
-// Admin Command: Audit All
 bot.onText(/\/audit/, async (msg) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
@@ -251,7 +256,6 @@ bot.onText(/\/audit/, async (msg) => {
         for (let row of users.rows) {
             const penalized = await auditUser(row.chat_id);
             if (penalized) penalizedCount++;
-            // Small delay to prevent API flood limits
             await new Promise(r => setTimeout(r, 1000));
         }
         
@@ -261,7 +265,6 @@ bot.onText(/\/audit/, async (msg) => {
     }
 });
 
-// Admin Commands (Add/Deduct/Ban/Unban)
 bot.onText(/\/add (\d+) (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
@@ -320,7 +323,6 @@ bot.onText(/\/unban (\d+)/, async (msg, match) => {
     }
 });
 
-// General Message Handler
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -329,7 +331,6 @@ bot.on('message', async (msg) => {
     if (!text) return;
     if (!(await isUserAllowed(userId))) return;
 
-    // Handle Cancel globally for states
     if (text === 'Cancel' || text === '/cancel') {
         if (userStates.has(userId)) {
             userStates.delete(userId);
@@ -470,7 +471,6 @@ bot.on('message', async (msg) => {
     }
 });
 
-// Callbacks (Verification & Admin Withdrawals)
 bot.on('callback_query', async (query) => {
     const userId = query.from.id;
     const chatId = query.message.chat.id;
@@ -506,7 +506,6 @@ bot.on('callback_query', async (query) => {
         }
     }
 
-    // Admin Handlers
     if (data.startsWith('approve_') && userId.toString() === process.env.ADMIN_ID) {
         const parts = data.split('_');
         const txId = parts[1];
