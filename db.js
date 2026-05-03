@@ -27,12 +27,15 @@ const initDB = async () => {
     `;
     await pool.query(createUsers);
 
-    // Force add columns if they don't exist (Fixes the /setbank error on existing databases)
+    // Force add missing columns
     await safeAddColumn('users', 'bank_name', 'VARCHAR(255)');
     await safeAddColumn('users', 'account_name', 'VARCHAR(255)');
     await safeAddColumn('users', 'account_number', 'VARCHAR(255) UNIQUE');
+    await safeAddColumn('users', 'is_banned', 'BOOLEAN DEFAULT FALSE');
+    await safeAddColumn('users', 'last_admin_msg_id', 'INTEGER');
+    await safeAddColumn('users', 'last_active_time', 'BIGINT');
 
-    // 2. Transactions Table (For /records)
+    // 2. Transactions Table
     const createTransactions = `
         CREATE TABLE IF NOT EXISTS transactions (
             id SERIAL PRIMARY KEY,
