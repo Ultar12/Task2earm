@@ -8,7 +8,7 @@ const port = process.env.PORT || 3000;
 const url = process.env.APP_URL;
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { webHook: { port: port } });
-bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, { allowed_updates: ['message', 'callback_query'] }); // Removed chat_member from allowed updates
+bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, { allowed_updates: ['message', 'callback_query'] });
 
 const stringSession = new StringSession(process.env.STRING_SESSION);
 const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), process.env.API_HASH, {
@@ -19,14 +19,12 @@ const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), 
 const pendingCaptchas = new Map();
 const userStates = new Map(); 
 
-// Middleware to block banned users
 async function isUserAllowed(userId) {
     const res = await pool.query('SELECT is_banned FROM users WHERE chat_id = $1', [userId]);
     if (res.rows.length > 0 && res.rows[0].is_banned) return false;
     return true;
 }
 
-// Admin Activity Tracker
 async function trackUserActivity(msg, action) {
     const userId = msg.from.id;
     const adminId = process.env.ADMIN_ID;
@@ -78,8 +76,6 @@ async function checkMembership(userId) {
         }));
         return true;
     } catch (e) {
-        // Only return false if we strictly confirm they are not in the group. 
-        // If the API rate limits us, we assume true to prevent accidental account wipes.
         if (e.message && e.message.includes('USER_NOT_PARTICIPANT')) {
             return false;
         }
@@ -87,7 +83,6 @@ async function checkMembership(userId) {
     }
 }
 
-// Smart Penalty Audit
 async function auditUser(userId) {
     if (userId.toString() === process.env.ADMIN_ID) return false;
 
@@ -100,21 +95,19 @@ async function auditUser(userId) {
             const currentBalance = userRes.rows[0].balance;
             const referrer = userRes.rows[0].referred_by;
 
-            // Apply Penalty to User
             await pool.query('UPDATE users SET balance = 0, is_verified = FALSE WHERE chat_id = $1', [userId]);
             await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'penalty_left_group', -currentBalance]);
             bot.sendMessage(userId, "System Audit Failed: You left the required group. Your account has been unverified and your balance reset to 0 NGN.", { reply_markup: { remove_keyboard: true } }).catch(()=>{});
 
-            // Apply Penalty to Referrer
             if (referrer) {
                 await pool.query('UPDATE users SET balance = GREATEST(balance - 50, 0) WHERE chat_id = $1', [referrer]);
                 await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [referrer, 'referral_penalty', -50]);
                 bot.sendMessage(referrer, "Audit Alert: One of your verified referrals left the group. 50 NGN was deducted from your balance.").catch(()=>{});
             }
-            return true; // Indicates the user failed the audit
+            return true; 
         }
     }
-    return false; // User passed the audit
+    return false; 
 }
 
 const mainMenu = {
@@ -123,6 +116,13 @@ const mainMenu = {
             [{ text: 'Task' }, { text: 'Invite' }],
             [{ text: 'Balance' }, { text: 'Support' }]
         ],
+        resize_keyboard: true
+    }
+};
+
+const cancelMenu = {
+    reply_markup: {
+        keyboard: [[{ text: 'Cancel' }]],
         resize_keyboard: true
     }
 };
@@ -202,7 +202,7 @@ bot.onText(/\/setbank/, async (msg) => {
     }
 
     userStates.set(userId, { step: 'AWAITING_BANK_NAME' });
-    bot.sendMessage(chatId, "Please enter your Bank Name:");
+    bot.sendMessage(chatId, "Please enter your Bank Name:", cancelMenu);
 });
 
 // Withdraw Command
@@ -212,7 +212,6 @@ bot.onText(/\/withdraw/, async (msg) => {
     const isAdmin = userId.toString() === process.env.ADMIN_ID;
     if (!(await isUserAllowed(userId))) return;
 
-    // Run audit before allowing withdrawal
     if (await auditUser(userId)) return;
 
     await trackUserActivity(msg, "Initiated Withdrawal");
@@ -228,22 +227,46 @@ bot.onText(/\/withdraw/, async (msg) => {
         return bot.sendMessage(chatId, "You have not set your bank info yet. Please use /setbank first.");
     }
 
-    if (user.balance < process.env.MIN_WITHDRAW) {
-        return bot.sendMessage(chatId, `Your balance is too low. Minimum withdrawal is ${parseInt(process.env.MIN_WITHDRAW).toLocaleString()} NGN.`);
+    const minWithdraw = parseInt(process.env.MIN_WITHDRAW) || 500;
+
+    if (user.balance < minWithdraw) {
+        return bot.sendMessage(chatId, `Your balance is too low. Minimum withdrawal is ${minWithdraw.toLocaleString()} NGN.`);
     }
 
     userStates.set(userId, { step: 'AWAITING_WITHDRAW_AMOUNT', user: user });
-    bot.sendMessage(chatId, `Enter the amount you want to withdraw (Minimum: ${parseInt(process.env.MIN_WITHDRAW).toLocaleString()} NGN):`);
+    bot.sendMessage(chatId, `Enter the amount you want to withdraw (Minimum: ${minWithdraw.toLocaleString()} NGN):`, cancelMenu);
 });
 
-// Admin Commands
-bot.onText(/\/add (\d+) (\d+)/, async (msg, match) => {
+// Admin Command: Audit All
+bot.onText(/\/audit/, async (msg) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
 
+    bot.sendMessage(chatId, "Starting manual audit of all verified users. This may take a moment...");
+    
+    try {
+        const users = await pool.query('SELECT chat_id FROM users WHERE is_verified = TRUE');
+        let penalizedCount = 0;
+        
+        for (let row of users.rows) {
+            const penalized = await auditUser(row.chat_id);
+            if (penalized) penalizedCount++;
+            // Small delay to prevent API flood limits
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        
+        bot.sendMessage(chatId, `Audit complete. Found and penalized ${penalizedCount} user(s) who left the group.`);
+    } catch (e) {
+        bot.sendMessage(chatId, "An error occurred during the audit.");
+    }
+});
+
+// Admin Commands (Add/Deduct/Ban/Unban)
+bot.onText(/\/add (\d+) (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
     const targetUserId = match[1];
     const amount = parseInt(match[2]);
-
     try {
         const res = await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2 RETURNING balance', [amount, targetUserId]);
         if (res.rowCount > 0) {
@@ -259,10 +282,8 @@ bot.onText(/\/add (\d+) (\d+)/, async (msg, match) => {
 bot.onText(/\/deduct (\d+) (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
-
     const targetUserId = match[1];
     const amount = parseInt(match[2]);
-
     try {
         const res = await pool.query('UPDATE users SET balance = GREATEST(balance - $1, 0) WHERE chat_id = $2 RETURNING balance', [amount, targetUserId]);
         if (res.rowCount > 0) {
@@ -278,7 +299,6 @@ bot.onText(/\/deduct (\d+) (\d+)/, async (msg, match) => {
 bot.onText(/\/ban (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
-
     const targetUserId = match[1];
     try {
         await pool.query('UPDATE users SET is_banned = TRUE WHERE chat_id = $1', [targetUserId]);
@@ -291,7 +311,6 @@ bot.onText(/\/ban (\d+)/, async (msg, match) => {
 bot.onText(/\/unban (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
-
     const targetUserId = match[1];
     try {
         await pool.query('UPDATE users SET is_banned = FALSE WHERE chat_id = $1', [targetUserId]);
@@ -310,6 +329,14 @@ bot.on('message', async (msg) => {
     if (!text) return;
     if (!(await isUserAllowed(userId))) return;
 
+    // Handle Cancel globally for states
+    if (text === 'Cancel' || text === '/cancel') {
+        if (userStates.has(userId)) {
+            userStates.delete(userId);
+            return bot.sendMessage(chatId, "Operation cancelled.", mainMenu);
+        }
+    }
+
     if (text.startsWith('/') && text !== '/setbank' && text !== '/withdraw') {
         userStates.delete(userId);
     }
@@ -318,11 +345,11 @@ bot.on('message', async (msg) => {
         const expected = pendingCaptchas.get(userId).answer;
         if (parseInt(text) === expected) {
             pendingCaptchas.delete(userId);
-            return bot.sendMessage(chatId, "Captcha passed!\n\nNow, you MUST join our group to use this bot. The channel is optional.", {
+            return bot.sendMessage(chatId, "Captcha passed!\n\nNow, you must join our group to use this bot.", {
                 reply_markup: {
                     inline_keyboard: [
-                        [{ text: "Join Group (Required)", url: "https://t.me/+jgcu6IbmbisxOTM1" }],
-                        [{ text: "Join Channel (Optional)", url: "https://t.me/+Rci2m853ppA0NWY1" }],
+                        [{ text: "Join Group", url: "https://t.me/+jgcu6IbmbisxOTM1" }],
+                        [{ text: "Join Channel", url: "https://t.me/+Rci2m853ppA0NWY1" }],
                         [{ text: "I have joined", callback_data: "verify_join" }]
                     ]
                 }
@@ -339,14 +366,14 @@ bot.on('message', async (msg) => {
             state.bank_name = text;
             state.step = 'AWAITING_ACCOUNT_NAME';
             userStates.set(userId, state);
-            return bot.sendMessage(chatId, "Received. Now, please enter your Account Name:");
+            return bot.sendMessage(chatId, "Received. Now, please enter your Account Name:", cancelMenu);
         }
 
         if (state.step === 'AWAITING_ACCOUNT_NAME') {
             state.account_name = text;
             state.step = 'AWAITING_ACCOUNT_NUMBER';
             userStates.set(userId, state);
-            return bot.sendMessage(chatId, "Received. Finally, please enter your Account Number:");
+            return bot.sendMessage(chatId, "Received. Finally, please enter your Account Number:", cancelMenu);
         }
 
         if (state.step === 'AWAITING_ACCOUNT_NUMBER') {
@@ -356,27 +383,27 @@ bot.on('message', async (msg) => {
                     [state.bank_name, state.account_name, text, userId]
                 );
                 userStates.delete(userId);
-                return bot.sendMessage(chatId, "Your bank information has been successfully saved. You can now use /withdraw.");
+                return bot.sendMessage(chatId, "Your bank information has been successfully saved. You can now use /withdraw.", mainMenu);
             } catch (err) {
                 if (err.code === '23505') {
                     userStates.delete(userId);
-                    return bot.sendMessage(chatId, "Error: This account number is already registered to another user. Process cancelled. Please use /setbank to try again with a valid account.");
+                    return bot.sendMessage(chatId, "Error: This account number is already registered to another user. Process cancelled. Please use /setbank to try again with a valid account.", mainMenu);
                 }
-                return bot.sendMessage(chatId, "An error occurred while saving your details. Please try again later.");
+                return bot.sendMessage(chatId, "An error occurred while saving your details. Please try again later.", mainMenu);
             }
         }
 
         if (state.step === 'AWAITING_WITHDRAW_AMOUNT') {
             const amount = parseInt(text);
             const user = state.user;
-            const minWithdraw = parseInt(process.env.MIN_WITHDRAW);
+            const minWithdraw = parseInt(process.env.MIN_WITHDRAW) || 500;
 
             if (isNaN(amount) || amount < minWithdraw) {
-                return bot.sendMessage(chatId, `Please enter a valid number that is at least ${minWithdraw.toLocaleString()}.`);
+                return bot.sendMessage(chatId, `Please enter a valid number that is at least ${minWithdraw.toLocaleString()}.`, cancelMenu);
             }
 
             if (amount > user.balance) {
-                return bot.sendMessage(chatId, `Insufficient balance. Your current balance is ${user.balance.toLocaleString()} NGN.`);
+                return bot.sendMessage(chatId, `Insufficient balance. Your current balance is ${user.balance.toLocaleString()} NGN.`, cancelMenu);
             }
 
             try {
@@ -386,7 +413,7 @@ bot.on('message', async (msg) => {
                 const txId = txRes.rows[0].id;
                 
                 userStates.delete(userId);
-                bot.sendMessage(chatId, "Success, waiting for approval...");
+                bot.sendMessage(chatId, "Success, waiting for approval...", mainMenu);
 
                 const adminMessage = `New Withdrawal Request:\n\nUser ID: ${userId}\nUsername: @${user.username || 'None'}\nAmount: ${amount.toLocaleString()} NGN\n\nBank Name: ${user.bank_name}\nAccount Name: ${user.account_name}\nAccount Number: ${user.account_number}`;
                 
@@ -400,7 +427,7 @@ bot.on('message', async (msg) => {
                 });
 
             } catch (err) {
-                bot.sendMessage(chatId, "An error occurred while processing your withdrawal. Please try again later.");
+                bot.sendMessage(chatId, "An error occurred while processing your withdrawal. Please try again later.", mainMenu);
             }
             return;
         }
