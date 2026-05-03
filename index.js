@@ -74,23 +74,21 @@ async function checkMembership(userId) {
             channel: groupId,
             participant: userId
         }));
-        return true;
+        return true; // Successfully confirmed they are in the group
     } catch (e) {
-        // Protect against rate limit bans
+        // Protect against rate limit bans (Assume true so we don't wipe accounts during audits)
         if (e.code === 420 || String(e).toUpperCase().includes('FLOOD')) {
             return true; 
         }
         
-        // Strict catch for any 400 error (Bad Request) or known participant invalidation strings
-        const errStr = String(e.message || e.className || "").toUpperCase();
-        if (e.code === 400 || errStr.includes('PARTICIPANT') || errStr.includes('INVALID') || errStr.includes('BANNED')) {
-            return false;
-        }
+        // Log the error to your Heroku console so you can see exactly why it's failing
+        console.log(`[Audit Failed for ${userId}]:`, e.message || e.className);
         
-        // Default to true for unknown connection errors to avoid wiping users due to server hiccups
-        return true; 
+        // STRICT FALLBACK: Any other error means they are NOT verified.
+        return false; 
     }
 }
+
 
 async function auditUser(userId) {
     if (userId.toString() === process.env.ADMIN_ID) return false;
