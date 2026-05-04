@@ -185,7 +185,7 @@ bot.on('message', async (msg) => {
         return replaceMessage(chatId, userId, "Operation cancelled.", mainMenu);
     }
 
-    if (text.startsWith('/start')) {
+        if (text.startsWith('/start')) {
         const payload = text.split(' ')[1]; 
         const referredBy = payload ? parseInt(payload) : null;
         
@@ -198,7 +198,7 @@ bot.on('message', async (msg) => {
 
             // --- ANTI-CHEAT: Check if they are ALREADY in the group ---
             if (finalReferrer) {
-                let loadMsg = await bot.sendMessage(chatId, "Initializing your dashboard...");
+                let loadMsg = await bot.sendMessage(chatId, "Initializing...");
                 const isAlreadyInGroup = await checkMembership(userId, msg.from.username ? `@${msg.from.username}` : null);
                 
                 if (isAlreadyInGroup) {
@@ -214,6 +214,7 @@ bot.on('message', async (msg) => {
             );
         } else if (res.rows[0].is_verified || isAdmin) {
             await trackUserActivity(msg, "Started Bot");
+            // Uses normal sendMessage so it doesn't delete the welcome message
             bot.sendMessage(chatId, "Welcome back to your dashboard.", mainMenu);
             state.lastBotMsgId = null; 
             userStates.set(userId, state);
@@ -230,6 +231,7 @@ bot.on('message', async (msg) => {
         const num1 = Math.floor(Math.random() * 10) + 1;
         const num2 = Math.floor(Math.random() * 10) + 1;
         
+        // Ensure the active referrer (or null if they cheated) is properly passed to the captcha
         const currentRes = await pool.query('SELECT referred_by FROM users WHERE chat_id = $1', [userId]);
         const activeReferrer = currentRes.rows.length > 0 ? currentRes.rows[0].referred_by : null;
         
@@ -258,6 +260,7 @@ bot.on('message', async (msg) => {
             return replaceMessage(chatId, userId, "Incorrect. Type the correct answer, or send /start for a new captcha.");
         }
     }
+
 
     if (state.step) {
         if (state.step === 'AWAITING_BANK_NAME') {
