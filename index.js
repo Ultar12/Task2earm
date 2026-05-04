@@ -547,6 +547,52 @@ bot.on('callback_query', async (query) => {
 
 // --- ADMIN COMMANDS ---
 
+bot.onText(/\/stats/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+
+    let loadMsg = await bot.sendMessage(chatId, "Fetching statistics...");
+
+    try {
+        const [
+            totalUsersRes,
+            verifiedUsersRes,
+            bannedUsersRes,
+            totalBalanceRes,
+            totalPaidRes,
+            totalPendingRes
+        ] = await Promise.all([
+            pool.query('SELECT COUNT(*) FROM users'),
+            pool.query('SELECT COUNT(*) FROM users WHERE is_verified = TRUE'),
+            pool.query('SELECT COUNT(*) FROM users WHERE is_banned = TRUE'),
+            pool.query('SELECT SUM(balance) FROM users'),
+            pool.query(`SELECT SUM(amount) FROM transactions WHERE type = 'withdrawal' AND status = 'completed'`),
+            pool.query(`SELECT SUM(amount) FROM transactions WHERE type = 'withdrawal' AND status = 'pending'`)
+        ]);
+
+        const totalUsers = parseInt(totalUsersRes.rows[0].count) || 0;
+        const verifiedUsers = parseInt(verifiedUsersRes.rows[0].count) || 0;
+        const bannedUsers = parseInt(bannedUsersRes.rows[0].count) || 0;
+        const totalBalance = parseInt(totalBalanceRes.rows[0].sum) || 0;
+        const totalPaid = parseInt(totalPaidRes.rows[0].sum) || 0;
+        const totalPending = parseInt(totalPendingRes.rows[0].sum) || 0;
+
+        const statsMsg = `Bot Statistics\n\n` +
+                         `Users:\n` +
+                         `- Total Users: ${totalUsers.toLocaleString()}\n` +
+                         `- Verified: ${verifiedUsers.toLocaleString()}\n` +
+                         `- Banned: ${bannedUsers.toLocaleString()}\n\n` +
+                         `Finances:\n` +
+                         `- Total User Balances: ${totalBalance.toLocaleString()} NGN\n` +
+                         `- Total Paid Out: ${totalPaid.toLocaleString()} NGN\n` +
+                         `- Pending Withdrawals: ${totalPending.toLocaleString()} NGN`;
+
+        bot.editMessageText(statsMsg, { chat_id: chatId, message_id: loadMsg.message_id });
+    } catch (e) {
+        bot.editMessageText(`Error fetching stats: ${e.message}`, { chat_id: chatId, message_id: loadMsg.message_id });
+    }
+});
+
 bot.onText(/\/pending/, async (msg) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
