@@ -8,8 +8,8 @@ const { pool, initDB } = require('./db');
 const port = process.env.PORT || 3000;
 const url = process.env.APP_URL;
 
+// Initialize bot but DO NOT set webhook yet
 const bot = new TelegramBot(process.env.BOT_TOKEN, { webHook: { port: port } });
-bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, { allowed_updates: ['message', 'callback_query'] });
 
 const stringSession = new StringSession(process.env.STRING_SESSION);
 const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), process.env.API_HASH, {
@@ -144,6 +144,21 @@ async function auditUser(userId) {
         }
     }
     return false; 
+}
+
+// --- AUTO-REFUND ENGINE ---
+async function processAutoRefunds() {
+    try {
+        const res = await pool.query(`SELECT id, chat_id, amount FROM transactions WHERE type = 'withdrawal' AND status = 'pending' AND created_at < NOW() - INTERVAL '24 hours'`);
+        for (let row of res.rows) {
+            await pool.query("UPDATE transactions SET status = 'refunded' WHERE id = $1", [row.id]);
+            await pool.query("UPDATE users SET balance = balance + $1 WHERE chat_id = $2", [row.amount, row.chat_id]);
+            await pool.query("INSERT INTO transactions (chat_id, type, amount, status) VALUES ($1, $2, $3, $4)", [row.chat_id, 'refund', row.amount, 'completed']);
+            bot.sendMessage(row.chat_id, `System Alert: Your withdrawal of ${row.amount.toLocaleString()} NGN has been refunded to your bot balance because it was pending for over 24 hours without processing.`).catch(()=>{});
+        }
+    } catch (err) {
+        console.log("Auto-refund error:", err.message);
+    }
 }
 
 const mainMenu = {
@@ -532,6 +547,38 @@ bot.on('callback_query', async (query) => {
 
 // --- ADMIN COMMANDS ---
 
+bot.onText(/\/pending/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+    
+    await processAutoRefunds();
+
+    try {
+        const res = await pool.query(`
+            SELECT t.id, t.chat_id, t.amount, t.created_at, u.username, u.bank_name, u.account_name, u.account_number 
+            FROM transactions t 
+            JOIN users u ON t.chat_id = u.chat_id 
+            WHERE t.type = 'withdrawal' AND t.status = 'pending' 
+            ORDER BY t.created_at ASC
+            LIMIT 20
+        `);
+
+        if (res.rows.length === 0) {
+            return bot.sendMessage(chatId, "There are no pending withdrawals at the moment.");
+        }
+
+        let pendingMsg = `Pending Withdrawals (Showing oldest 20):\n\n`;
+        for (let row of res.rows) {
+            const pendingHours = Math.abs(Date.now() - new Date(row.created_at).getTime()) / 36e5;
+            pendingMsg += `ID: ${row.id} | User: ${row.chat_id} (${row.username || 'None'})\nAmount: ${row.amount.toLocaleString()} NGN\nBank: ${row.bank_name}\nName: ${row.account_name}\nAcc: ${row.account_number}\nAge: ${pendingHours.toFixed(1)} hrs\n\n`;
+        }
+
+        bot.sendMessage(chatId, pendingMsg);
+    } catch (e) {
+        bot.sendMessage(chatId, "Error fetching pending withdrawals.");
+    }
+});
+
 bot.onText(/\/deluser (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
@@ -628,8 +675,16 @@ bot.onText(/\/audit/, async (msg) => {
     }
 });
 
+// STARTUP SEQUENCE
 (async () => {
     await initDB();
+    
+    bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, { allowed_updates: ['message', 'callback_query'] });
+
+    // Start Auto-Refund interval (checks every hour)
+    setInterval(processAutoRefunds, 60 * 60 * 1000);
+    processAutoRefunds(); 
+
     console.log("Connecting UserBot...");
     await userBot.connect();
     console.log("UserBot connected.");
@@ -647,17 +702,16 @@ bot.onText(/\/audit/, async (msg) => {
         console.log("WARNING: Could not find M4U-Nigeria in userbot's chat list.");
     }
 
-    // --- GRAMJS CHAT-TO-EARN ENGINE ---
     userBot.addEventHandler(async (event) => {
         try {
             const message = event.message;
             if (!message || !message.peerId) return;
+            if (!resolvedGroupEntity) return;
 
-            let eventChatId = message.chatId ? message.chatId.toString() : "";
-            let envChatId = process.env.GROUP_CHAT_ID ? process.env.GROUP_CHAT_ID.toString() : "";
+            const msgChatIdStr = message.chatId ? message.chatId.toString().replace(/^-100/, '') : "";
+            const resolvedChatIdStr = resolvedGroupEntity.id ? resolvedGroupEntity.id.toString().replace(/^-100/, '') : "";
 
-            // Safely check if the message is coming from the configured group ID
-            if (eventChatId && envChatId && (envChatId === eventChatId || envChatId === `-100${eventChatId}`)) {
+            if (msgChatIdStr && resolvedChatIdStr && msgChatIdStr === resolvedChatIdStr) {
                 const senderId = message.senderId ? message.senderId.toString() : null;
                 if (!senderId) return;
 
