@@ -2,6 +2,7 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
+const { NewMessage } = require('telegram/events');
 const { pool, initDB } = require('./db');
 
 const port = process.env.PORT || 3000;
@@ -168,6 +169,8 @@ bot.on('message', async (msg) => {
     const userId = msg.from.id;
     const text = msg.text;
 
+    // Only process private messages through the main bot dashboard
+    if (msg.chat.type !== 'private') return;
     if (!text) return;
 
     if (!text.startsWith('/start')) {
@@ -185,7 +188,7 @@ bot.on('message', async (msg) => {
         return replaceMessage(chatId, userId, "Operation cancelled.", mainMenu);
     }
 
-        if (text.startsWith('/start')) {
+    if (text.startsWith('/start')) {
         const payload = text.split(' ')[1]; 
         const referredBy = payload ? parseInt(payload) : null;
         
@@ -196,7 +199,6 @@ bot.on('message', async (msg) => {
         if (res.rows.length === 0) {
             let finalReferrer = referredBy !== userId ? referredBy : null;
 
-            // --- ANTI-CHEAT: Check if they are ALREADY in the group ---
             if (finalReferrer) {
                 let loadMsg = await bot.sendMessage(chatId, "Initializing...");
                 const isAlreadyInGroup = await checkMembership(userId, msg.from.username ? `@${msg.from.username}` : null);
@@ -214,7 +216,6 @@ bot.on('message', async (msg) => {
             );
         } else if (res.rows[0].is_verified || isAdmin) {
             await trackUserActivity(msg, "Started Bot");
-            // Uses normal sendMessage so it doesn't delete the welcome message
             bot.sendMessage(chatId, "Welcome back to your dashboard.", mainMenu);
             state.lastBotMsgId = null; 
             userStates.set(userId, state);
@@ -231,14 +232,13 @@ bot.on('message', async (msg) => {
         const num1 = Math.floor(Math.random() * 10) + 1;
         const num2 = Math.floor(Math.random() * 10) + 1;
         
-        // Ensure the active referrer (or null if they cheated) is properly passed to the captcha
         const currentRes = await pool.query('SELECT referred_by FROM users WHERE chat_id = $1', [userId]);
         const activeReferrer = currentRes.rows.length > 0 ? currentRes.rows[0].referred_by : null;
         
         pendingCaptchas.set(userId, { answer: num1 + num2, referredBy: activeReferrer });
 
-        bot.sendMessage(chatId, `To proceed, please solve this simple math problem:\n\n${num1} + ${num2} = ?\n\nType the correct number below.`);
-        state.lastBotMsgId = null;
+        const captchaMsg = await bot.sendMessage(chatId, `${num1} + ${num2} = ?`);
+        state.lastBotMsgId = captchaMsg.message_id;
         userStates.set(userId, state);
         return;
     }
@@ -260,7 +260,6 @@ bot.on('message', async (msg) => {
             return replaceMessage(chatId, userId, "Incorrect. Type the correct answer, or send /start for a new captcha.");
         }
     }
-
 
     if (state.step) {
         if (state.step === 'AWAITING_BANK_NAME') {
@@ -344,7 +343,7 @@ bot.on('message', async (msg) => {
     if (text === 'Task') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Checked Tasks");
-        replaceMessage(chatId, userId, "Task Center:\n\n1. /signin - Claim 100 NGN daily.\n(Note: You must have at least 10 verified referrals TODAY to unlock this).", mainMenu);
+        replaceMessage(chatId, userId, `Task Center:\n\n1. /signin - Claim 10 NGN daily.\n(Requires at least 1 verified referral TODAY).\n\n2. Group Chat - Earn ${process.env.MESSAGE_REWARD || 5} NGN per message inside the M4U-Nigeria group (Max 100 NGN/day).`, mainMenu);
     } 
     else if (text === '/signin') {
         if (await auditUser(userId)) return;
@@ -360,8 +359,8 @@ bot.on('message', async (msg) => {
         
         const refsToday = parseInt(todayRefCheck.rows[0].count);
 
-        if (refsToday < 10) {
-            return replaceMessage(chatId, userId, `You cannot sign in yet. You need at least 10 verified referrals TODAY to unlock daily sign-ins.\n\nYour valid referrals today: ${refsToday}/10`, mainMenu);
+        if (refsToday < 1) {
+            return replaceMessage(chatId, userId, `You cannot sign in yet. You need at least 1 verified referral TODAY to unlock daily sign-ins.\n\nYour valid referrals today: 0/1`, mainMenu);
         }
 
         const todayCheck = await pool.query(`SELECT id FROM transactions WHERE chat_id = $1 AND type = 'signin_bonus' AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`, [userId]);
@@ -369,10 +368,10 @@ bot.on('message', async (msg) => {
             return replaceMessage(chatId, userId, "You have already claimed your daily sign-in bonus today. Come back tomorrow.", mainMenu);
         }
 
-        await pool.query('UPDATE users SET balance = balance + 100 WHERE chat_id = $1', [userId]);
-        await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'signin_bonus', 100]);
+        await pool.query('UPDATE users SET balance = balance + 10 WHERE chat_id = $1', [userId]);
+        await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'signin_bonus', 10]);
         
-        replaceMessage(chatId, userId, "Sign-in successful! 100 NGN has been added to your balance.", mainMenu);
+        replaceMessage(chatId, userId, "Sign-in successful! 10 NGN has been added to your balance.", mainMenu);
     }
     else if (text === 'Top Referrers' || text === '/toprefs') {
         if (await auditUser(userId)) return;
@@ -647,5 +646,48 @@ bot.onText(/\/audit/, async (msg) => {
     if (!resolvedGroupEntity) {
         console.log("WARNING: Could not find M4U-Nigeria in userbot's chat list.");
     }
+
+    // --- GRAMJS CHAT-TO-EARN ENGINE ---
+    userBot.addEventHandler(async (event) => {
+        try {
+            const message = event.message;
+            if (!message || !message.peerId) return;
+
+            let eventChatId = message.chatId ? message.chatId.toString() : "";
+            let envChatId = process.env.GROUP_CHAT_ID ? process.env.GROUP_CHAT_ID.toString() : "";
+
+            // Safely check if the message is coming from the configured group ID
+            if (eventChatId && envChatId && (envChatId === eventChatId || envChatId === `-100${eventChatId}`)) {
+                const senderId = message.senderId ? message.senderId.toString() : null;
+                if (!senderId) return;
+
+                const userRes = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [senderId]);
+                
+                if (userRes.rows.length > 0 && userRes.rows[0].is_verified) {
+                    const reward = parseInt(process.env.MESSAGE_REWARD) || 5;
+                    const maxDaily = 100;
+
+                    const todayCheck = await pool.query(
+                        `SELECT COALESCE(SUM(amount), 0) as total_earned 
+                         FROM transactions 
+                         WHERE chat_id = $1 AND type = 'chat_reward' 
+                         AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`,
+                        [senderId]
+                    );
+
+                    const earnedToday = parseInt(todayCheck.rows[0].total_earned);
+
+                    if (earnedToday < maxDaily) {
+                        const amountToGive = Math.min(reward, maxDaily - earnedToday);
+                        await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2', [amountToGive, senderId]);
+                        await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [senderId, 'chat_reward', amountToGive]);
+                    }
+                }
+            }
+        } catch (err) {
+            console.log("Chat-to-earn processing error:", err.message);
+        }
+    }, new NewMessage({}));
+
     console.log(`Main bot is running on Webhooks, port: ${port}`);
 })();
