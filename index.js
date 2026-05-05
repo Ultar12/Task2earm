@@ -198,8 +198,8 @@ bot.on('message', async (msg) => {
             // Ignore unverified or unregistered users silently
             if (userRes.rows.length === 0 || !userRes.rows[0].is_verified) return;
 
-            const reward = parseInt(process.env.MESSAGE_REWARD) || 5;
-            const maxDaily = 100;
+            const reward = parseInt(process.env.MESSAGE_REWARD) || 3;
+            const maxDaily = parseInt(process.env.MAX_DAILY_CHAT) || 100;
 
             const todayCheck = await pool.query(
                 `SELECT COALESCE(SUM(amount), 0) as total_earned 
@@ -318,6 +318,22 @@ bot.on('message', async (msg) => {
 
     if (state.step) {
         if (state.step === 'AWAITING_BANK_NAME') {
+            const allowedBanks = ['Opay', 'Palmpay', 'Kuda', 'Moniepoint'];
+            
+            if (!allowedBanks.includes(text)) {
+                const bankMenu = {
+                    reply_markup: {
+                        keyboard: [
+                            [{ text: 'Opay' }, { text: 'Palmpay' }],
+                            [{ text: 'Kuda' }, { text: 'Moniepoint' }],
+                            [{ text: 'Cancel' }]
+                        ],
+                        resize_keyboard: true
+                    }
+                };
+                return replaceMessage(chatId, userId, "Please strictly use the buttons below to select your Bank Name. Manual typing is not allowed:", bankMenu);
+            }
+
             state.bank_name = text;
             state.step = 'AWAITING_ACCOUNT_NAME';
             userStates.set(userId, state);
@@ -328,10 +344,14 @@ bot.on('message', async (msg) => {
             state.account_name = text;
             state.step = 'AWAITING_ACCOUNT_NUMBER';
             userStates.set(userId, state);
-            return replaceMessage(chatId, userId, "Account name saved. Finally, type your Account Number:", cancelMenu);
+            return replaceMessage(chatId, userId, "Account name saved. Finally, type your Account Number (Must be exactly 10 digits):", cancelMenu);
         }
 
         if (state.step === 'AWAITING_ACCOUNT_NUMBER') {
+            if (!/^\d{10}$/.test(text)) {
+                return replaceMessage(chatId, userId, "Invalid input. Your account number must be exactly 10 digits. Please try again:", cancelMenu);
+            }
+
             try {
                 await pool.query(
                     'UPDATE users SET bank_name = $1, account_name = $2, account_number = $3 WHERE chat_id = $4',
@@ -372,7 +392,7 @@ bot.on('message', async (msg) => {
                 userStates.set(userId, state);
                 replaceMessage(chatId, userId, "Withdrawal submitted successfully. Waiting for admin approval...", mainMenu);
 
-                const adminMessage = `New Withdrawal Request:\n\nUser ID: ${userId}\nUsername: ${user.username || 'None'}\nAmount: ${amount.toLocaleString()} NGN\n\nBank: ${user.bank_name}\nName: ${user.account_name}\nAccount: ${user.account_number}`;
+                const adminMessage = `New Withdrawal Request:\n\nUser ID: ${userId}\nUsername: ${user.username || 'None'}\nAmount: ${amount.toLocaleString()} NGN\n\nBank: ${user.bank_name}\nName: ${user.account_name}\nAccount: ${user.account_number}\n\nApprove via: /approve ${txId}`;
                 bot.sendMessage(process.env.ADMIN_ID, adminMessage, {
                     reply_markup: {
                         inline_keyboard: [
@@ -395,11 +415,11 @@ bot.on('message', async (msg) => {
         return replaceMessage(chatId, userId, "You must complete the verification process first.", { reply_markup: { remove_keyboard: true }});
     }
 
-        if (text === 'Task') {
+    if (text === 'Task') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Checked Tasks");
         
-        const reward = process.env.MESSAGE_REWARD || 5;
+        const reward = process.env.MESSAGE_REWARD || 3;
         
         const taskMsg = `*Task Center*\n\n` + 
                         `*1. Daily Sign-in* - /signin\n` +
@@ -410,13 +430,11 @@ bot.on('message', async (msg) => {
                         `└ Maximum: 100 NGN per day.\n` +
                         `└ Just chat naturally in the group and your balance will increase automatically.`;
 
-        // Adding { parse_mode: 'Markdown' } so the bold text shows up properly
         replaceMessage(chatId, userId, taskMsg, { 
             parse_mode: 'Markdown',
             ...mainMenu 
         });
     } 
-
     else if (text === '/signin') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Attempted Sign-in");
@@ -511,7 +529,18 @@ bot.on('message', async (msg) => {
     else if (text === '/setbank') {
         state.step = 'AWAITING_BANK_NAME';
         userStates.set(userId, state);
-        replaceMessage(chatId, userId, "Please type your Bank Name below:", cancelMenu);
+        
+        const bankMenu = {
+            reply_markup: {
+                keyboard: [
+                    [{ text: 'Opay' }, { text: 'Palmpay' }],
+                    [{ text: 'Kuda' }, { text: 'Moniepoint' }],
+                    [{ text: 'Cancel' }]
+                ],
+                resize_keyboard: true
+            }
+        };
+        replaceMessage(chatId, userId, "Please select your Bank Name from the options below:", bankMenu);
     }
     else if (text === '/withdraw') {
         const res = await pool.query('SELECT * FROM users WHERE chat_id = $1', [userId]);
@@ -519,6 +548,19 @@ bot.on('message', async (msg) => {
         if (!user.bank_name || !user.account_name || !user.account_number) {
             return replaceMessage(chatId, userId, "You have not set your bank info yet. Please send /setbank first.", mainMenu);
         }
+
+        // --- CHECK DAILY WITHDRAWAL LIMIT ---
+        const todayWithdrawal = await pool.query(
+            `SELECT id FROM transactions 
+             WHERE chat_id = $1 AND type = 'withdrawal' 
+             AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`,
+            [userId]
+        );
+        
+        if (todayWithdrawal.rows.length > 0) {
+            return replaceMessage(chatId, userId, "You have already requested a withdrawal today. You can only withdraw once per day.", mainMenu);
+        }
+
         state.step = 'AWAITING_WITHDRAW_AMOUNT';
         state.user = user;
         userStates.set(userId, state);
@@ -562,7 +604,7 @@ bot.on('callback_query', async (query) => {
         
         if (isMember) {
             await pool.query('UPDATE users SET is_verified = TRUE, balance = balance + 50 WHERE chat_id = $1', [userId]);
-            await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'welcome_bonus', 100]);
+            await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'welcome_bonus', 50]);
             
             const userRes = await pool.query('SELECT referred_by FROM users WHERE chat_id = $1', [userId]);
             const referrer = userRes.rows[0]?.referred_by;
@@ -603,6 +645,36 @@ bot.on('callback_query', async (query) => {
 });
 
 // --- ADMIN COMMANDS ---
+
+bot.onText(/\/approve (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+    
+    const txId = match[1];
+
+    try {
+        const txRes = await pool.query(`SELECT chat_id, status, amount FROM transactions WHERE id = $1 AND type = 'withdrawal'`, [txId]);
+        
+        if (txRes.rows.length === 0) {
+            return bot.sendMessage(chatId, `Error: Transaction ID ${txId} not found or is not a withdrawal.`);
+        }
+        
+        if (txRes.rows[0].status !== 'pending') {
+            return bot.sendMessage(chatId, `Notice: Transaction ID ${txId} has already been marked as ${txRes.rows[0].status}.`);
+        }
+
+        const targetUser = txRes.rows[0].chat_id;
+        const amount = txRes.rows[0].amount;
+
+        await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
+        
+        bot.sendMessage(chatId, `Successfully approved withdrawal ID: ${txId} for ${amount.toLocaleString()} NGN.`);
+        bot.sendMessage(targetUser, "Your withdrawal request has been approved and processed.").catch(()=>{});
+        
+    } catch (e) {
+        bot.sendMessage(chatId, `Database error while approving withdrawal: ${e.message}`);
+    }
+});
 
 bot.onText(/\/stats/, async (msg) => {
     const chatId = msg.chat.id;
@@ -681,38 +753,6 @@ bot.onText(/\/pending/, async (msg) => {
         bot.sendMessage(chatId, "Error fetching pending withdrawals.");
     }
 });
-
-
-bot.onText(/\/approve (\d+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
-    
-    const txId = match[1];
-
-    try {
-        const txRes = await pool.query(`SELECT chat_id, status, amount FROM transactions WHERE id = $1 AND type = 'withdrawal'`, [txId]);
-        
-        if (txRes.rows.length === 0) {
-            return bot.sendMessage(chatId, `Error: Transaction ID ${txId} not found or is not a withdrawal.`);
-        }
-        
-        if (txRes.rows[0].status !== 'pending') {
-            return bot.sendMessage(chatId, `Notice: Transaction ID ${txId} has already been marked as ${txRes.rows[0].status}.`);
-        }
-
-        const targetUser = txRes.rows[0].chat_id;
-        const amount = txRes.rows[0].amount;
-
-        await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
-        
-        bot.sendMessage(chatId, `Successfully approved withdrawal ID: ${txId} for ${amount.toLocaleString()} NGN.`);
-        bot.sendMessage(targetUser, "Your withdrawal request has been approved and processed.").catch(()=>{});
-        
-    } catch (e) {
-        bot.sendMessage(chatId, `Database error while approving withdrawal: ${e.message}`);
-    }
-});
-
 
 bot.onText(/\/deluser (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
