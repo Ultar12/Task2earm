@@ -3,12 +3,10 @@ const TelegramBot = require('node-telegram-bot-api');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { pool, initDB } = require('./db');
-const axios = require('axios'); 
 
 const port = process.env.PORT || 3000;
 const url = process.env.APP_URL;
 
-// Initialize bot
 const bot = new TelegramBot(process.env.BOT_TOKEN, { webHook: { port: port } });
 bot.setWebHook(`${url}/bot${process.env.BOT_TOKEN}`, { allowed_updates: ['message', 'callback_query'] });
 
@@ -185,15 +183,8 @@ bot.on('message', async (msg) => {
     // --- 2. DASHBOARD ENGINE (PRIVATE MESSAGES) ---
     if (msg.chat.type !== 'private') return;
 
-    // FIX: Allow /setbank and /withdraw to pass through the dashboard filter
-    const userCommands = ['/setbank', '/withdraw', '/signin', '/toprefs', '/records', '/start'];
-    const isUserCmd = userCommands.some(cmd => text.startsWith(cmd));
-
-    if (text.startsWith('/')) {
-        if (!isUserCmd) return; // If it's a command but NOT one of ours, stop (Admin commands handled by bot.onText)
-    } else {
-        bot.deleteMessage(chatId, msg.message_id).catch(() => {});
-    }
+    // --- FIX: DELETE ALL COMMANDS AND TEXT TO KEEP CHAT CLEAN ---
+    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
 
     if (!(await isUserAllowed(userId))) return;
 
@@ -243,6 +234,10 @@ bot.on('message', async (msg) => {
 
     if (state.step) {
         if (state.step === 'AWAITING_ACCOUNT_NAME') {
+            // --- FIX: ACCOUNT NAME ALPHABETICAL ONLY ---
+            if (!/^[a-zA-Z\s]+$/.test(text)) {
+                return replaceMessage(chatId, userId, "Invalid input. Account name should only contain letters. Please try again:", cancelMenu);
+            }
             state.account_name = text;
             state.step = 'AWAITING_ACCOUNT_NUMBER';
             userStates.set(userId, state);
@@ -273,31 +268,22 @@ bot.on('message', async (msg) => {
             const failedAudit = await auditUser(userId);
             if (failedAudit) { state.step = null; userStates.set(userId, state); return; }
 
-            let txId; 
             try {
+                // --- FIX: REMOVED AUTOMATIC PAYMENT - NOW SUBMITS TO ADMIN ---
                 await pool.query('UPDATE users SET balance = balance - $1 WHERE chat_id = $2', [amount, userId]);
                 const txRes = await pool.query('INSERT INTO transactions (chat_id, type, amount, status) VALUES ($1, $2, $3, $4) RETURNING id', [userId, 'withdrawal', amount, 'pending']);
-                txId = txRes.rows[0].id;
-                state.step = null; userStates.set(userId, state);
+                const txId = txRes.rows[0].id;
+                
+                state.step = null; 
+                userStates.set(userId, state);
+                
+                // Show "Processing..." briefly then main menu
                 await replaceMessage(chatId, userId, "Processing...", mainMenu);
 
-                const bankCodes = { 'Opay': '090399', 'Palmpay': '090328', 'Kuda': '090267', 'Moniepoint': '090405' };
-                const flwBankCode = bankCodes[user.bank_name];
-                const flwPayload = {
-                    account_bank: flwBankCode, account_number: user.account_number, amount: amount, narration: "M4U-Nigeria Reward", currency: "NGN", reference: `M4U_AUTO_${txId}_${Date.now()}`
-                };
-                const flwResponse = await axios.post('https://api.flutterwave.com/v3/transfers', flwPayload, { headers: { 'Authorization': `Bearer ${process.env.FLW_SECRET_KEY}` } });
-
-                if (flwResponse.data.status === "success") {
-                    await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
-                    replaceMessage(chatId, userId, `Withdrawal Successful!\n\n${amount.toLocaleString()} NGN has been sent to your ${user.bank_name} account.`, mainMenu);
-                } else { throw new Error("Flutterwave returned a non-success status."); }
+                const adminMsg = `New Manual Withdrawal Request:\n\nUser: ${userId}\nAmount: ${amount} NGN\nBank: ${user.bank_name}\nName: ${user.account_name}\nAcc: ${user.account_number}\n\n/approve ${txId}`;
+                bot.sendMessage(process.env.ADMIN_ID, adminMsg, { reply_markup: { inline_keyboard: [[{ text: "Approve", callback_data: `approve_${txId}_${userId}_${amount}` }, { text: "Reject", callback_data: `reject_${txId}_${userId}_${amount}` }]] } });
             } catch (err) {
-                replaceMessage(chatId, userId, "Network issue. Forwarded to admin for manual review.", mainMenu);
-                if (txId) {
-                    const adminMsg = `Auto-Payout Failed User: ${userId}\nAmount: ${amount} NGN\nBank: ${user.bank_name}\nAcc: ${user.account_number}\n/approve ${txId}`;
-                    bot.sendMessage(process.env.ADMIN_ID, adminMsg, { reply_markup: { inline_keyboard: [[{ text: "Approve Manually", callback_data: `approve_${txId}_${userId}_${amount}` }]] } });
-                }
+                replaceMessage(chatId, userId, "An error occurred. Please try again.", mainMenu);
             }
             return;
         }
@@ -360,7 +346,7 @@ bot.on('callback_query', async (query) => {
         let state = userStates.get(userId) || {};
         state.bank_name = bank; state.step = 'AWAITING_ACCOUNT_NAME'; userStates.set(userId, state);
         bot.answerCallbackQuery(query.id);
-        return replaceMessage(chatId, userId, `Bank saved: ${bank}\nNow, type your Account Name:`, cancelMenu);
+        return replaceMessage(chatId, userId, `Bank saved: ${bank}\nNow, type your Account Name (Letters only):`, cancelMenu);
     }
     if (data === 'cancel_op') {
         let state = userStates.get(userId) || {}; state.step = null; userStates.set(userId, state);
@@ -444,6 +430,22 @@ bot.onText(/\/add (\d+) (\d+)/, async (msg, match) => {
             bot.sendMessage(msg.chat.id, `Added ${amount} to ${target}. New balance: ${res.rows[0].balance}`);
         } else { bot.sendMessage(msg.chat.id, "User not found."); }
     } catch (err) { bot.sendMessage(msg.chat.id, "Error."); }
+});
+
+bot.onText(/\/audit/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+    let statusMsg = await bot.sendMessage(chatId, "Starting manual audit...");
+    try {
+        const users = await pool.query('SELECT chat_id FROM users WHERE is_verified = TRUE');
+        let penalizedCount = 0;
+        for (let row of users.rows) {
+            const penalized = await auditUser(row.chat_id);
+            if (penalized) penalizedCount++;
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        bot.editMessageText(`Audit complete. Penalized ${penalizedCount} user(s).`, { chat_id: chatId, message_id: statusMsg.message_id });
+    } catch (e) { bot.editMessageText("Error during audit.", { chat_id: chatId, message_id: statusMsg.message_id }); }
 });
 
 (async () => {
