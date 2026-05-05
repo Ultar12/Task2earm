@@ -2,7 +2,6 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
-const { NewMessage } = require('telegram/events');
 const { pool, initDB } = require('./db');
 
 const port = process.env.PORT || 3000;
@@ -184,9 +183,50 @@ bot.on('message', async (msg) => {
     const userId = msg.from.id;
     const text = msg.text;
 
-    // Only process private messages through the main bot dashboard
-    if (msg.chat.type !== 'private') return;
     if (!text) return;
+
+    // --- 1. CHAT-TO-EARN ENGINE (GROUP MESSAGES) ---
+    if (msg.chat.type === 'group' || msg.chat.type === 'supergroup') {
+        const targetGroupId = process.env.GROUP_ID; 
+        
+        // Ignore messages from other groups
+        if (chatId.toString() !== targetGroupId) return;
+
+        try {
+            const userRes = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [userId]);
+            
+            // Ignore unverified or unregistered users silently
+            if (userRes.rows.length === 0 || !userRes.rows[0].is_verified) return;
+
+            const reward = parseInt(process.env.MESSAGE_REWARD) || 5;
+            const maxDaily = 100;
+
+            const todayCheck = await pool.query(
+                `SELECT COALESCE(SUM(amount), 0) as total_earned 
+                 FROM transactions 
+                 WHERE chat_id = $1 AND type = 'chat_reward' 
+                 AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`,
+                [userId]
+            );
+
+            const earnedToday = parseInt(todayCheck.rows[0].total_earned);
+
+            if (earnedToday < maxDaily) {
+                const amountToGive = Math.min(reward, maxDaily - earnedToday);
+                await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2', [amountToGive, userId]);
+                await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'chat_reward', amountToGive]);
+                console.log(`[Standard Bot Chat2Earn] SUCCESS: Added ${amountToGive} NGN to ${userId}.`);
+            }
+        } catch (err) {
+            console.log("Standard Bot Chat-to-earn error:", err.message);
+        }
+        
+        // Stop execution here so group messages don't trigger the private dashboard logic
+        return; 
+    }
+
+    // --- 2. MAIN DASHBOARD ENGINE (PRIVATE MESSAGES) ---
+    if (msg.chat.type !== 'private') return;
 
     if (!text.startsWith('/start')) {
         bot.deleteMessage(chatId, msg.message_id).catch(() => {});
@@ -761,67 +801,7 @@ bot.onText(/\/audit/, async (msg) => {
     if (!resolvedGroupEntity) {
         console.log("WARNING: Could not find M4U-Nigeria in userbot's chat list.");
     } else {
-                // --- GRAMJS CHAT-TO-EARN ENGINE (STRICT TARGETING) ---
-        
-        // 1. Cache your user account ID once on startup so you don't spam the API
-        const me = await userBot.getMe();
-        const myBotUserId = me.id.toString();
-
-        // 2. Lock the listener strictly to the M4U-Nigeria group
-        userBot.addEventHandler(async (event) => {
-            try {
-                const message = event.message;
-                
-                let senderId = message.senderId ? message.senderId.toString() : null;
-                
-                // If the message is outgoing (sent by the account hosting the string session)
-                if (!senderId && message.out) {
-                    senderId = myBotUserId;
-                }
-
-                if (!senderId) return;
-
-                console.log(`[Chat2Earn] Message detected from ID: ${senderId}`);
-
-                const userRes = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [senderId]);
-                
-                if (userRes.rows.length === 0) {
-                    console.log(`[Chat2Earn] Ignored: User ${senderId} not in database.`);
-                    return;
-                }
-
-                if (!userRes.rows[0].is_verified) {
-                    console.log(`[Chat2Earn] Ignored: User ${senderId} is not fully verified.`);
-                    return;
-                }
-
-                const reward = parseInt(process.env.MESSAGE_REWARD) || 5;
-                const maxDaily = 100;
-
-                const todayCheck = await pool.query(
-                    `SELECT COALESCE(SUM(amount), 0) as total_earned 
-                     FROM transactions 
-                     WHERE chat_id = $1 AND type = 'chat_reward' 
-                     AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`,
-                    [senderId]
-                );
-
-                const earnedToday = parseInt(todayCheck.rows[0].total_earned);
-
-                if (earnedToday < maxDaily) {
-                    const amountToGive = Math.min(reward, maxDaily - earnedToday);
-                    await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2', [amountToGive, senderId]);
-                    await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [senderId, 'chat_reward', amountToGive]);
-                    console.log(`[Chat2Earn] SUCCESS: Added ${amountToGive} NGN to ${senderId}. Total today: ${earnedToday + amountToGive}/${maxDaily}`);
-                } else {
-                    console.log(`[Chat2Earn] LIMIT REACHED: User ${senderId} hit ${maxDaily} NGN daily limit.`);
-                }
-            } catch (err) {
-                console.log("Chat-to-earn processing error:", err.message);
-            }
-                }, new NewMessage({ chats: [resolvedGroupEntity.id] })); 
-
-
+        console.log("M4U-Nigeria group verified for membership checks. Chat-to-earn is now handled by standard bot.");
     }
 
     console.log(`Main bot is running on Webhooks, port: ${port}`);
