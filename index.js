@@ -463,7 +463,7 @@ bot.on('message', async (msg) => {
             }
             return;
         }
- 
+    }
 
     const userStatus = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [userId]);
     const isVerified = userStatus.rows.length > 0 && userStatus.rows[0].is_verified;
