@@ -395,11 +395,28 @@ bot.on('message', async (msg) => {
         return replaceMessage(chatId, userId, "You must complete the verification process first.", { reply_markup: { remove_keyboard: true }});
     }
 
-    if (text === 'Task') {
+        if (text === 'Task') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Checked Tasks");
-        replaceMessage(chatId, userId, `Task Center:\n\n1. /signin - Claim 10 NGN daily.\n(Requires at least 1 verified referral TODAY).\n\n2. Group Chat - Earn ${process.env.MESSAGE_REWARD || 5} NGN per message inside the M4U-Nigeria group (Max 100 NGN/day).`, mainMenu);
+        
+        const reward = process.env.MESSAGE_REWARD || 5;
+        
+        const taskMsg = `*Task Center*\n\n` + 
+                        `*1. Daily Sign-in* - /signin\n` +
+                        `└ Claim 10 NGN daily.\n` +
+                        `└ (Requires at least 1 verified referral TODAY).\n\n` +
+                        `*2. Chat to Earn*\n` +
+                        `└ Earn ${reward} NGN for every normal message you send in the M4U-Nigeria group!\n` +
+                        `└ Maximum: 100 NGN per day.\n` +
+                        `└ Just chat naturally in the group and your balance will increase automatically.`;
+
+        // Adding { parse_mode: 'Markdown' } so the bold text shows up properly
+        replaceMessage(chatId, userId, taskMsg, { 
+            parse_mode: 'Markdown',
+            ...mainMenu 
+        });
     } 
+
     else if (text === '/signin') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Attempted Sign-in");
