@@ -544,7 +544,7 @@ bot.on('callback_query', async (query) => {
         const isMember = await checkMembership(userId, username);
         
         if (isMember) {
-            await pool.query('UPDATE users SET is_verified = TRUE, balance = balance + 100 WHERE chat_id = $1', [userId]);
+            await pool.query('UPDATE users SET is_verified = TRUE, balance = balance + 50 WHERE chat_id = $1', [userId]);
             await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [userId, 'welcome_bonus', 100]);
             
             const userRes = await pool.query('SELECT referred_by FROM users WHERE chat_id = $1', [userId]);
@@ -557,7 +557,7 @@ bot.on('callback_query', async (query) => {
                 bot.sendMessage(referrer, `Your referral has been verified! You earned ${refReward.toLocaleString()} NGN.`).catch(()=>{});
             }
             bot.answerCallbackQuery(query.id, { text: "Verification successful!" });
-            return replaceMessage(chatId, userId, "Verification successful! You received a 100 NGN welcome bonus.", mainMenu);
+            return replaceMessage(chatId, userId, "Verification successful! You received a 50 NGN welcome bonus.", mainMenu);
         } else {
             return bot.answerCallbackQuery(query.id, { text: "You haven't joined the required group yet. Please join and try again.", show_alert: true });
         }
