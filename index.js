@@ -19,7 +19,6 @@ const userBot = new TelegramClient(stringSession, parseInt(process.env.API_ID), 
 
 const pendingCaptchas = new Map();
 const userStates = new Map(); 
-let resolvedGroupEntity = null; 
 
 // --- HELPER: CLEAN UI ENGINE ---
 async function replaceMessage(chatId, userId, text, options = {}) {
@@ -89,14 +88,12 @@ async function sendNewNotification(userId, adminId, text, now) {
 
 async function checkMembership(userId, username = null) {
     try {
-        if (!resolvedGroupEntity) return false;
+        const targetGroupId = process.env.GROUP_CHAT_ID;
+        if (!targetGroupId) return false;
 
-        try {
-            const recentMembers = await userBot.getParticipants(resolvedGroupEntity, { limit: 100 });
-            const foundInRecent = recentMembers.find(m => m.id.toString() === userId.toString());
-            if (foundInRecent) return true; 
-        } catch (scrapeErr) {}
-
+        // Strip the -100 to pass correctly to GramJS
+        const rawGroupId = targetGroupId.replace(/^-100/, '');
+        
         let targetEntity = null;
         if (username && username !== 'None') {
             try { targetEntity = await userBot.getEntity(username); } catch (err) {}
@@ -104,7 +101,7 @@ async function checkMembership(userId, username = null) {
 
         try {
             await userBot.invoke(new Api.channels.GetParticipant({
-                channel: resolvedGroupEntity,
+                channel: rawGroupId,
                 participant: targetEntity ? targetEntity : userId
             }));
             return true; 
@@ -220,7 +217,6 @@ bot.on('message', async (msg) => {
                 
                 if (isAlreadyInGroup) {
                     finalReferrer = null; 
-                    console.log(`[Anti-Cheat] User ${userId} was already in the group. Referral cancelled.`);
                 }
                 bot.deleteMessage(chatId, loadMsg.message_id).catch(()=>{});
             }
@@ -358,7 +354,7 @@ bot.on('message', async (msg) => {
     if (text === 'Task') {
         if (await auditUser(userId)) return;
         await trackUserActivity(msg, "Checked Tasks");
-        replaceMessage(chatId, userId, `Task Center:\n\n1. /signin - Claim 10 NGN daily.\n(Requires at least 1 verified referral TODAY).\n\n2. Group Chat - Earn ${process.env.MESSAGE_REWARD || 5} NGN per message inside the M4U-Nigeria group (Max 100 NGN/day).`, mainMenu);
+        replaceMessage(chatId, userId, `Task Center:\n\n1. /signin - Claim 10 NGN daily.\n(Requires at least 1 verified referral TODAY).\n\n2. Group Chat - Earn ${process.env.MESSAGE_REWARD || 5} NGN per text message inside the M4U-Nigeria group (Max 100 NGN/day).`, mainMenu);
     } 
     else if (text === '/signin') {
         if (await auditUser(userId)) return;
@@ -749,72 +745,66 @@ bot.onText(/\/audit/, async (msg) => {
     await userBot.connect();
     console.log("UserBot connected.");
 
-    console.log("Scanning chats for the group...");
-    const dialogs = await userBot.getDialogs();
-    for (const dialog of dialogs) {
-        if (dialog.title && dialog.title.includes('M4U-Nigeria')) {
-            resolvedGroupEntity = dialog.entity;
-            console.log(`Found group: ${dialog.title}`);
-            break;
-        }
-    }
-    if (!resolvedGroupEntity) {
-        console.log("WARNING: Could not find M4U-Nigeria in userbot's chat list.");
+    const targetEnvId = process.env.GROUP_CHAT_ID ? process.env.GROUP_CHAT_ID.toString().replace(/^-100/, '') : null;
+    
+    if (!targetEnvId) {
+        console.log("WARNING: GROUP_CHAT_ID is missing from .env!");
     } else {
-        // --- GRAMJS CHAT-TO-EARN ENGINE (STRICT TARGETING) ---
+        console.log(`Chat-to-Earn engine successfully locked onto Exact Group ID: ${process.env.GROUP_CHAT_ID}`);
+        
+        // This stops GramJS from spamming old messages that were sent while the bot was restarting.
+        const bootTime = Math.floor(Date.now() / 1000);
+
         userBot.addEventHandler(async (event) => {
             try {
                 const message = event.message;
                 
-                let senderId = message.senderId ? message.senderId.toString() : null;
-                if (!senderId && message.out) {
-                    const me = await userBot.getMe();
-                    senderId = me.id.toString();
-                }
-
-                if (!senderId) return;
-
-                console.log(`[Chat2Earn] Message detected from ID: ${senderId}`);
-
-                const userRes = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [senderId]);
+                // 1. Ignore old messages from before the bot booted up
+                if (message.date < bootTime) return;
                 
-                if (userRes.rows.length === 0) {
-                    console.log(`[Chat2Earn] Ignored: User ${senderId} not in database.`);
-                    return;
-                }
+                // 2. Ignore system events (joins, leaves, stickers, gifs, etc.)
+                if (!message.message) return;
 
-                if (!userRes.rows[0].is_verified) {
-                    console.log(`[Chat2Earn] Ignored: User ${senderId} is not fully verified.`);
-                    return;
-                }
+                const msgChatIdStr = message.chatId ? message.chatId.toString().replace(/^-100/, '') : "";
+                
+                if (msgChatIdStr === targetEnvId) {
+                    let senderId = message.senderId ? message.senderId.toString() : null;
+                    
+                    if (!senderId && message.out) {
+                        const me = await userBot.getMe();
+                        senderId = me.id.toString();
+                    }
 
-                const reward = parseInt(process.env.MESSAGE_REWARD) || 5;
-                const maxDaily = 100;
+                    if (!senderId) return;
 
-                const todayCheck = await pool.query(
-                    `SELECT COALESCE(SUM(amount), 0) as total_earned 
-                     FROM transactions 
-                     WHERE chat_id = $1 AND type = 'chat_reward' 
-                     AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`,
-                    [senderId]
-                );
+                    const userRes = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [senderId]);
+                    
+                    if (userRes.rows.length > 0 && userRes.rows[0].is_verified) {
+                        const reward = parseInt(process.env.MESSAGE_REWARD) || 5;
+                        const maxDaily = 100;
 
-                const earnedToday = parseInt(todayCheck.rows[0].total_earned);
+                        const todayCheck = await pool.query(
+                            `SELECT COALESCE(SUM(amount), 0) as total_earned 
+                             FROM transactions 
+                             WHERE chat_id = $1 AND type = 'chat_reward' 
+                             AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos')`,
+                            [senderId]
+                        );
 
-                if (earnedToday < maxDaily) {
-                    const amountToGive = Math.min(reward, maxDaily - earnedToday);
-                    await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2', [amountToGive, senderId]);
-                    await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [senderId, 'chat_reward', amountToGive]);
-                    console.log(`[Chat2Earn] SUCCESS: Added ${amountToGive} NGN to ${senderId}. Total today: ${earnedToday + amountToGive}/${maxDaily}`);
-                } else {
-                    console.log(`[Chat2Earn] LIMIT REACHED: User ${senderId} hit ${maxDaily} NGN daily limit.`);
+                        const earnedToday = parseInt(todayCheck.rows[0].total_earned);
+
+                        if (earnedToday < maxDaily) {
+                            const amountToGive = Math.min(reward, maxDaily - earnedToday);
+                            await pool.query('UPDATE users SET balance = balance + $1 WHERE chat_id = $2', [amountToGive, senderId]);
+                            await pool.query('INSERT INTO transactions (chat_id, type, amount) VALUES ($1, $2, $3)', [senderId, 'chat_reward', amountToGive]);
+                            console.log(`[Chat2Earn] SUCCESS: Added ${amountToGive} NGN to ${senderId}. Total today: ${earnedToday + amountToGive}/${maxDaily}`);
+                        }
+                    }
                 }
             } catch (err) {
                 console.log("Chat-to-earn processing error:", err.message);
             }
-                }, new NewMessage({}));
-
-        console.log("Chat-to-Earn engine successfully locked onto M4U-Nigeria.");
+        }, new NewMessage({}));
     }
 
     console.log(`Main bot is running on Webhooks, port: ${port}`);
