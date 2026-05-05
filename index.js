@@ -370,7 +370,7 @@ bot.on('message', async (msg) => {
             }
         }
 
-        if (state.step === 'AWAITING_WITHDRAW_AMOUNT') {
+               if (state.step === 'AWAITING_WITHDRAW_AMOUNT') {
             const amount = parseInt(text);
             const user = state.user;
             const minWithdraw = parseInt(process.env.MIN_WITHDRAW) || 500;
@@ -383,30 +383,87 @@ bot.on('message', async (msg) => {
                 return replaceMessage(chatId, userId, `Insufficient balance. Your current balance is ${user.balance.toLocaleString()} NGN.`, cancelMenu);
             }
 
+            // --- LIVE SECURITY AUDIT ---
+            // Verify they are still in the group right before paying them
+            const failedAudit = await auditUser(userId);
+            if (failedAudit) {
+                 state.step = null;
+                 userStates.set(userId, state);
+                 return; // The auditUser function already sends them the penalty message
+            }
+
             try {
+                // 1. Deduct balance and create pending transaction locally
                 await pool.query('UPDATE users SET balance = balance - $1 WHERE chat_id = $2', [amount, userId]);
                 const txRes = await pool.query('INSERT INTO transactions (chat_id, type, amount, status) VALUES ($1, $2, $3, $4) RETURNING id', [userId, 'withdrawal', amount, 'pending']);
                 const txId = txRes.rows[0].id;
                 
                 state.step = null;
                 userStates.set(userId, state);
-                replaceMessage(chatId, userId, "Withdrawal submitted successfully. Waiting for admin approval...", mainMenu);
+                
+                // Let user know it's processing
+                let processingMsg = await bot.sendMessage(chatId, "Initiating automatic payout to your bank... Please wait.", { reply_markup: mainMenu.reply_markup });
+                state.lastBotMsgId = processingMsg.message_id;
+                userStates.set(userId, state);
 
-                const adminMessage = `New Withdrawal Request:\n\nUser ID: ${userId}\nUsername: ${user.username || 'None'}\nAmount: ${amount.toLocaleString()} NGN\n\nBank: ${user.bank_name}\nName: ${user.account_name}\nAccount: ${user.account_number}\n\nApprove via: /approve ${txId}`;
+                // --- 2. FLUTTERWAVE AUTO-PAYMENT LOGIC ---
+                const bankCodes = {
+                    'Opay': '090399',
+                    'Palmpay': '090328',
+                    'Kuda': '090267',
+                    'Moniepoint': '090405'
+                };
+                const flwBankCode = bankCodes[user.bank_name];
+
+                if (!flwBankCode) {
+                    throw new Error(`Unrecognized bank name: ${user.bank_name}`);
+                }
+
+                const flwPayload = {
+                    account_bank: flwBankCode,
+                    account_number: user.account_number,
+                    amount: amount,
+                    narration: "M4U-Nigeria Reward",
+                    currency: "NGN",
+                    reference: `M4U_AUTO_${txId}_${Date.now()}`
+                };
+
+                const flwResponse = await axios.post('https://api.flutterwave.com/v3/transfers', flwPayload, {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.FLW_SECRET_KEY}`,
+                        'Content-Type': 'application/json'
+                    }
+                });
+
+                // 3. Process Success
+                if (flwResponse.data.status === "success") {
+                    await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
+                    replaceMessage(chatId, userId, `Withdrawal Successful!\n\n${amount.toLocaleString()} NGN has been sent to your ${user.bank_name} account (${user.account_number}).\nIt should reflect in a few seconds.`, mainMenu);
+                } else {
+                    throw new Error("Flutterwave returned a non-success status.");
+                }
+
+            } catch (err) {
+                console.error("Auto-Payout Error:", err.response ? err.response.data : err.message);
+                
+                // If Flutterwave fails (e.g. your FLW wallet is empty, or FLW network is down)
+                // Tell user it's pending manual review
+                replaceMessage(chatId, userId, "Your automatic withdrawal encountered a network issue with the bank. It has been forwarded to the admin for manual processing.", mainMenu);
+
+                // Send the manual approval fallback button to the Admin
+                const adminMessage = `Auto-Payout Failed\n\nUser ID: ${userId}\nAmount: ${amount.toLocaleString()} NGN\nBank: ${user.bank_name}\nAccount: ${user.account_number}\n\nError: ${err.response?.data?.message || err.message}\n\nApprove Manually via: /approve ${txId}`;
                 bot.sendMessage(process.env.ADMIN_ID, adminMessage, {
                     reply_markup: {
                         inline_keyboard: [
-                            [{ text: "Approve", callback_data: `approve_${txId}_${userId}_${amount}` }],
-                            [{ text: "Reject", callback_data: `reject_${txId}_${userId}_${amount}` }]
+                            [{ text: "Approve Manually", callback_data: `approve_${txId}_${userId}_${amount}` }],
+                            [{ text: "Reject & Refund", callback_data: `reject_${txId}_${userId}_${amount}` }]
                         ]
                     }
-                });
-            } catch (err) {
-                replaceMessage(chatId, userId, "An error occurred while processing your withdrawal.", mainMenu);
+                }).catch(()=>{});
             }
             return;
         }
-    }
+ 
 
     const userStatus = await pool.query('SELECT is_verified FROM users WHERE chat_id = $1', [userId]);
     const isVerified = userStatus.rows.length > 0 && userStatus.rows[0].is_verified;
