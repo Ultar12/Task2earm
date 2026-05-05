@@ -819,7 +819,8 @@ bot.onText(/\/audit/, async (msg) => {
             } catch (err) {
                 console.log("Chat-to-earn processing error:", err.message);
             }
-        }, new NewMessage({ chats: [resolvedGroupEntity] })); // <-- CRITICAL: Chat filter applied here
+                }, new NewMessage({ chats: [resolvedGroupEntity.id] })); 
+
 
     }
 
