@@ -812,7 +812,8 @@ bot.onText(/\/audit/, async (msg) => {
             } catch (err) {
                 console.log("Chat-to-earn processing error:", err.message);
             }
-        }, new NewMessage({ chats: [resolvedGroupEntity] }));
+                }, new NewMessage({}));
+
         console.log("Chat-to-Earn engine successfully locked onto M4U-Nigeria.");
     }
 
