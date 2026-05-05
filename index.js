@@ -761,15 +761,22 @@ bot.onText(/\/audit/, async (msg) => {
     if (!resolvedGroupEntity) {
         console.log("WARNING: Could not find M4U-Nigeria in userbot's chat list.");
     } else {
-        // --- GRAMJS CHAT-TO-EARN ENGINE (STRICT TARGETING) ---
+                // --- GRAMJS CHAT-TO-EARN ENGINE (STRICT TARGETING) ---
+        
+        // 1. Cache your user account ID once on startup so you don't spam the API
+        const me = await userBot.getMe();
+        const myBotUserId = me.id.toString();
+
+        // 2. Lock the listener strictly to the M4U-Nigeria group
         userBot.addEventHandler(async (event) => {
             try {
                 const message = event.message;
                 
                 let senderId = message.senderId ? message.senderId.toString() : null;
+                
+                // If the message is outgoing (sent by the account hosting the string session)
                 if (!senderId && message.out) {
-                    const me = await userBot.getMe();
-                    senderId = me.id.toString();
+                    senderId = myBotUserId;
                 }
 
                 if (!senderId) return;
@@ -812,9 +819,8 @@ bot.onText(/\/audit/, async (msg) => {
             } catch (err) {
                 console.log("Chat-to-earn processing error:", err.message);
             }
-                }, new NewMessage({}));
+        }, new NewMessage({ chats: [resolvedGroupEntity] })); // <-- CRITICAL: Chat filter applied here
 
-        console.log("Chat-to-Earn engine successfully locked onto M4U-Nigeria.");
     }
 
     console.log(`Main bot is running on Webhooks, port: ${port}`);
