@@ -682,6 +682,38 @@ bot.onText(/\/pending/, async (msg) => {
     }
 });
 
+
+bot.onText(/\/approve (\d+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
+    
+    const txId = match[1];
+
+    try {
+        const txRes = await pool.query(`SELECT chat_id, status, amount FROM transactions WHERE id = $1 AND type = 'withdrawal'`, [txId]);
+        
+        if (txRes.rows.length === 0) {
+            return bot.sendMessage(chatId, `Error: Transaction ID ${txId} not found or is not a withdrawal.`);
+        }
+        
+        if (txRes.rows[0].status !== 'pending') {
+            return bot.sendMessage(chatId, `Notice: Transaction ID ${txId} has already been marked as ${txRes.rows[0].status}.`);
+        }
+
+        const targetUser = txRes.rows[0].chat_id;
+        const amount = txRes.rows[0].amount;
+
+        await pool.query("UPDATE transactions SET status = 'completed' WHERE id = $1", [txId]);
+        
+        bot.sendMessage(chatId, `Successfully approved withdrawal ID: ${txId} for ${amount.toLocaleString()} NGN.`);
+        bot.sendMessage(targetUser, "Your withdrawal request has been approved and processed.").catch(()=>{});
+        
+    } catch (e) {
+        bot.sendMessage(chatId, `Database error while approving withdrawal: ${e.message}`);
+    }
+});
+
+
 bot.onText(/\/deluser (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (msg.from.id.toString() !== process.env.ADMIN_ID) return;
